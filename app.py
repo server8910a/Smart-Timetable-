@@ -1,5 +1,4 @@
 import json
-import sys
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from ortools.sat.python import cp_model
@@ -32,7 +31,8 @@ class TimetableSolver:
         self.num_slots = len(self.lesson_slots)
         self.num_days = len(self.working_days)
 
-        self.MAX_LESSONS_PER_DAY = int(self.rules.get('maxTeacherPerDay', 7))
+        # Global fallback values
+        self.global_max_per_day = int(self.rules.get('maxTeacherPerDay', 7))
         self.NO_REPEAT = self.rules.get('ruleNoRepeat') == '1'
         self.ENFORCE_MIN_PER_DAY = self.rules.get('ruleMinPerDay') == '1'
         self.FREE_PERIOD_LABEL = self.rules.get('freePeriodLabel', 'Free')
@@ -191,10 +191,9 @@ class TimetableSolver:
                 if subject_vars:
                     self.model.Add(sum(subject_vars) == required)
                 else:
-                    # This should never happen due to validation, but just in case:
                     raise ValueError(f"No variables for {grade} {stream_name} {subject}")
 
-        # 4. Teacher max lessons
+        # 4. Teacher max weekly lessons
         for teacher, t_data in self.teachers.items():
             max_lessons = t_data.get('maxLessons')
             if max_lessons is not None:
@@ -224,8 +223,11 @@ class TimetableSolver:
                             if teacher in self.flex[class_key][d_idx][slot_idx]:
                                 self.model.Add(self.flex[class_key][d_idx][slot_idx][teacher] == 0)
 
-        # 6. Max per day
-        for teacher in self.teachers:
+        # 6. Max per day (per-teacher or global)
+        for teacher, t_data in self.teachers.items():
+            teacher_max_per_day = t_data.get('maxPerDay')
+            if teacher_max_per_day is None:
+                teacher_max_per_day = self.global_max_per_day
             for d_idx in range(self.num_days):
                 day_vars = []
                 for (grade, s_idx, stream_name) in self.class_groups:
@@ -236,7 +238,7 @@ class TimetableSolver:
                         if teacher in self.flex[class_key][d_idx][slot_idx]:
                             day_vars.append(self.flex[class_key][d_idx][slot_idx][teacher])
                 if day_vars:
-                    self.model.Add(sum(day_vars) <= self.MAX_LESSONS_PER_DAY)
+                    self.model.Add(sum(day_vars) <= teacher_max_per_day)
 
         # 7. No back-to-back same subject
         if self.NO_REPEAT:
@@ -255,7 +257,7 @@ class TimetableSolver:
                                         var2 = self.x[class_key][d_idx][slot_idx+1][teacher2][subject]
                                         self.model.Add(var1 + var2 <= 1)
 
-        # 8. Max consecutive same subject
+        # 8. Max consecutive same subject (from overrides)
         for key, req in self.class_requirements.items():
             grade_str, subject = key.split('|')
             grade = int(grade_str)
@@ -277,7 +279,7 @@ class TimetableSolver:
                             if vars_in_window:
                                 self.model.Add(sum(vars_in_window) <= max_consec)
 
-        # 9. Min one lesson per day
+        # 9. Min one lesson per day (if enabled)
         if self.ENFORCE_MIN_PER_DAY:
             for teacher, t_data in self.teachers.items():
                 for d_idx, day in enumerate(self.working_days):
