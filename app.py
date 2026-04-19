@@ -31,7 +31,6 @@ class TimetableSolver:
         self.num_slots = len(self.lesson_slots)
         self.num_days = len(self.working_days)
 
-        # Global fallback values
         self.global_max_per_day = int(self.rules.get('maxTeacherPerDay', 7))
         self.NO_REPEAT = self.rules.get('ruleNoRepeat') == '1'
         self.ENFORCE_MIN_PER_DAY = self.rules.get('ruleMinPerDay') == '1'
@@ -48,14 +47,24 @@ class TimetableSolver:
                 stream_name = names[s_idx] if s_idx < len(names) else f"Stream {s_idx+1}"
                 self.class_groups.append((grade, s_idx, stream_name))
 
-        # Validate mandatory assignments BEFORE creating variables
+        # Validate assignments BEFORE creating variables
         self._validate_assignments()
 
-        # Variables
+        # Create mandatory and flex variables
         self.x = {}
         self.flex = {}
         self._create_mandatory_variables()
         self._create_flex_variables()
+
+        # Check that mandatory variables were created
+        total_mandatory_vars = 0
+        for class_key in self.x:
+            for d_idx in self.x[class_key]:
+                for slot_idx in self.x[class_key][d_idx]:
+                    for teacher_dict in self.x[class_key][d_idx][slot_idx].values():
+                        total_mandatory_vars += len(teacher_dict)
+        if total_mandatory_vars == 0:
+            raise ValueError("No mandatory lessons defined. Check teacher assignments and that per-stream settings match.")
 
         self.teacher_total_vars = {}
         for teacher in self.teachers:
@@ -65,21 +74,19 @@ class TimetableSolver:
         self.min_total = self.model.NewIntVar(0, 1000, 'min_total')
 
     def _validate_assignments(self):
-        """Check that every required grade/subject has at least one eligible teacher."""
+        """Ensure every required grade/subject/stream has at least one eligible teacher."""
         errors = []
         for (grade, s_idx, stream_name) in self.class_groups:
             for subject in self.subjects:
                 required = self._get_required_lessons(grade, subject, s_idx)
                 if required == 0:
                     continue
-                # Find eligible teachers
                 eligible = []
                 for teacher, t_data in self.teachers.items():
                     if f"{teacher}|{grade}" in self.blacklist:
                         continue
                     if f"{subject}|{grade}" in self.subject_blacklist:
                         continue
-                    # Check if teacher assigned to this grade/subject (and optionally stream)
                     for assign in t_data.get('assignments', []):
                         if assign.get('grade') != grade:
                             continue
@@ -367,7 +374,7 @@ def generate():
         if solution:
             return jsonify({"success": True, "timetable": solution})
         else:
-            return jsonify({"success": False, "message": "No feasible timetable found with current constraints."})
+            return jsonify({"success": False, "message": "No feasible timetable found. Check constraints (e.g., teacher max loads, available slots)."})
     except ValueError as e:
         return jsonify({"success": False, "message": str(e)})
     except Exception as e:
