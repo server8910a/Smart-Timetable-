@@ -1,4 +1,5 @@
 import json
+import sys
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from ortools.sat.python import cp_model
@@ -37,7 +38,7 @@ class TimetableSolver:
         self.FREE_PERIOD_LABEL = self.rules.get('freePeriodLabel', 'Free')
 
         # Build class groups
-        self.class_groups = []  # (grade, stream_index, stream_name)
+        self.class_groups = []
         for grade in self.target_grades:
             streams = self.grade_streams.get(str(grade), 1)
             names = self.grade_stream_names.get(str(grade), [])
@@ -47,9 +48,12 @@ class TimetableSolver:
                 stream_name = names[s_idx] if s_idx < len(names) else f"Stream {s_idx+1}"
                 self.class_groups.append((grade, s_idx, stream_name))
 
+        # Validate mandatory assignments BEFORE creating variables
+        self._validate_assignments()
+
         # Variables
-        self.x = {}   # mandatory: x[class_key][day][slot][teacher][subject]
-        self.flex = {} # flex: flex[class_key][day][slot][teacher]
+        self.x = {}
+        self.flex = {}
         self._create_mandatory_variables()
         self._create_flex_variables()
 
@@ -59,6 +63,37 @@ class TimetableSolver:
 
         self.max_total = self.model.NewIntVar(0, 1000, 'max_total')
         self.min_total = self.model.NewIntVar(0, 1000, 'min_total')
+
+    def _validate_assignments(self):
+        """Check that every required grade/subject has at least one eligible teacher."""
+        errors = []
+        for (grade, s_idx, stream_name) in self.class_groups:
+            for subject in self.subjects:
+                required = self._get_required_lessons(grade, subject, s_idx)
+                if required == 0:
+                    continue
+                # Find eligible teachers
+                eligible = []
+                for teacher, t_data in self.teachers.items():
+                    if f"{teacher}|{grade}" in self.blacklist:
+                        continue
+                    if f"{subject}|{grade}" in self.subject_blacklist:
+                        continue
+                    # Check if teacher assigned to this grade/subject (and optionally stream)
+                    for assign in t_data.get('assignments', []):
+                        if assign.get('grade') != grade:
+                            continue
+                        if assign.get('subject') != subject:
+                            continue
+                        if self.per_stream_enabled and assign.get('streamIndex') is not None:
+                            if assign['streamIndex'] != s_idx:
+                                continue
+                        eligible.append(teacher)
+                        break
+                if not eligible:
+                    errors.append(f"Grade {grade} {stream_name} - {subject}: No eligible teacher assigned")
+        if errors:
+            raise ValueError("Infeasible configuration:\n" + "\n".join(errors))
 
     def _get_class_key(self, grade, stream_index):
         return f"{grade}_{stream_index}"
@@ -155,6 +190,9 @@ class TimetableSolver:
                                 subject_vars.append(self.x[class_key][d_idx][slot_idx][teacher][subject])
                 if subject_vars:
                     self.model.Add(sum(subject_vars) == required)
+                else:
+                    # This should never happen due to validation, but just in case:
+                    raise ValueError(f"No variables for {grade} {stream_name} {subject}")
 
         # 4. Teacher max lessons
         for teacher, t_data in self.teachers.items():
@@ -328,8 +366,10 @@ def generate():
             return jsonify({"success": True, "timetable": solution})
         else:
             return jsonify({"success": False, "message": "No feasible timetable found with current constraints."})
-    except Exception as e:
+    except ValueError as e:
         return jsonify({"success": False, "message": str(e)})
+    except Exception as e:
+        return jsonify({"success": False, "message": "Internal error: " + str(e)})
 
 @app.route('/health', methods=['GET'])
 def health():
