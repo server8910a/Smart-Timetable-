@@ -2,3 +2,15 @@ Flask==2.3.3
 flask-cors==4.0.0
 ortools==9.15.6755
 gunicorn==21.2.0
+mip==1.15.0
+PuLP==2.9.0
+Pyomo==6.8.0
+scipy==1.14.0
+deap==1.4.1
+optuna==3.6.0
+hyperopt==0.2.7
+scikit-optimize==0.10.2
+nevergrad==1.0.0
+pygad==3.3.1
+simanneal==0.5.0
+numpy==1.26.0
