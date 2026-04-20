@@ -25,6 +25,7 @@ class TimetableSolver:
         self.per_stream_enabled = self.rules.get('perStreamEnabled') == '1'
         self.grade_streams = config.get('gradeStreams', {})
         self.grade_stream_names = config.get('gradeStreamNames', {})
+        self.common_session = config.get('commonSession', {'enabled': False})
 
         self.lesson_slots = [s for s in self.time_slots if s.get('type') == 'lesson']
         self.num_slots = len(self.lesson_slots)
@@ -109,10 +110,30 @@ class TimetableSolver:
             for d in range(self.num_days):
                 for s in range(self.num_slots):
                     self.model.Add(sum(v for d in self.x[ck][d][s].values() for v in d.values()) + sum(self.flex[ck][d][s].values()) <= 1)
+
+        if self.common_session.get('enabled'):
+            day = self.common_session.get('day', 'FRI')
+            slot_idx = self.common_session.get('slotIndex', 0)
+            if day in self.working_days and slot_idx < self.num_slots:
+                d_idx = self.working_days.index(day)
+                for (grade, s_idx, stream_name) in self.class_groups:
+                    ck = self._get_class_key(grade, s_idx)
+                    for teacher_dict in self.x[ck][d_idx][slot_idx].values():
+                        for var in teacher_dict.values(): self.model.Add(var == 0)
+                    for teacher, var in self.flex[ck][d_idx][slot_idx].items(): self.model.Add(var == 0)
+
         for teacher in self.teachers:
             for d in range(self.num_days):
                 for s in range(self.num_slots):
-                    self.model.Add(sum(v for (g, si, _) in self.class_groups for v in (self.x.get(self._get_class_key(g,si),{}).get(d,{}).get(s,{}).get(teacher,{}).values() if teacher in self.x.get(self._get_class_key(g,si),{}).get(d,{}).get(s,{})) ) + sum(self.flex.get(self._get_class_key(g,si),{}).get(d,{}).get(s,{}).get(teacher,0) for (g,si,_) in self.class_groups) <= 1)
+                    tv = []
+                    for (g, si, _) in self.class_groups:
+                        ck = self._get_class_key(g, si)
+                        if ck in self.x and d in self.x[ck] and s in self.x[ck][d] and teacher in self.x[ck][d][s]:
+                            tv.extend(self.x[ck][d][s][teacher].values())
+                        if ck in self.flex and d in self.flex[ck] and s in self.flex[ck][d] and teacher in self.flex[ck][d][s]:
+                            tv.append(self.flex[ck][d][s][teacher])
+                    self.model.Add(sum(tv) <= 1)
+
         for (grade, s_idx, stream_name) in self.class_groups:
             ck = self._get_class_key(grade, s_idx)
             for subject in self.subjects:
@@ -125,6 +146,7 @@ class TimetableSolver:
                             if teacher in self.x[ck][d][s] and subject in self.x[ck][d][s][teacher]:
                                 vars.append(self.x[ck][d][s][teacher][subject])
                 if vars: self.model.Add(sum(vars) == required)
+
         for teacher, t_data in self.teachers.items():
             if t_data.get('maxLessons'):
                 vars = []
@@ -153,7 +175,32 @@ class TimetableSolver:
                         if teacher in self.x[ck][d_idx][s]: vars.extend(self.x[ck][d_idx][s][teacher].values())
                         if teacher in self.flex[ck][d_idx][s]: vars.append(self.flex[ck][d_idx][s][teacher])
                 if vars: self.model.Add(sum(vars) <= max_per_day)
-        # Fairness objective
+
+        if self.NO_REPEAT:
+            for (grade, s_idx, stream_name) in self.class_groups:
+                ck = self._get_class_key(grade, s_idx)
+                for d in range(self.num_days):
+                    for s in range(self.num_slots - 1):
+                        for t1 in self.teachers:
+                            if t1 not in self.x[ck][d][s]: continue
+                            for subj, v1 in self.x[ck][d][s][t1].items():
+                                for t2 in self.teachers:
+                                    if t2 not in self.x[ck][d][s+1]: continue
+                                    if subj in self.x[ck][d][s+1][t2]:
+                                        self.model.Add(v1 + self.x[ck][d][s+1][t2][subj] <= 1)
+
+        if self.ENFORCE_MIN_PER_DAY:
+            for teacher, t_data in self.teachers.items():
+                for d_idx, day in enumerate(self.working_days):
+                    if day in t_data.get('unavailDays', []): continue
+                    vars = []
+                    for (g, si, _) in self.class_groups:
+                        ck = self._get_class_key(g, si)
+                        for s in range(self.num_slots):
+                            if teacher in self.x[ck][d_idx][s]: vars.extend(self.x[ck][d_idx][s][teacher].values())
+                            if teacher in self.flex[ck][d_idx][s]: vars.append(self.flex[ck][d_idx][s][teacher])
+                    if vars: self.model.Add(sum(vars) >= 1)
+
         for teacher in self.teachers:
             vars = []
             for (g, si, _) in self.class_groups:
@@ -163,6 +210,7 @@ class TimetableSolver:
                         if teacher in self.x[ck][d][s]: vars.extend(self.x[ck][d][s][teacher].values())
                         if teacher in self.flex[ck][d][s]: vars.append(self.flex[ck][d][s][teacher])
             if vars: self.model.Add(self.teacher_total_vars[teacher] == sum(vars))
+
         totals = list(self.teacher_total_vars.values())
         if totals:
             self.model.AddMaxEquality(self.max_total, totals)
@@ -184,16 +232,16 @@ class TimetableSolver:
             timetable[ck] = {"grade": grade, "streamIndex": s_idx, "streamName": stream_name, "days": {}}
             for d_idx, day in enumerate(self.working_days):
                 timetable[ck]["days"][day] = []
-                for s_idx in range(self.num_slots):
+                for slot_idx in range(self.num_slots):
                     cell = None
-                    for teacher, subjects in self.x[ck][d_idx][s_idx].items():
+                    for teacher, subjects in self.x[ck][d_idx][slot_idx].items():
                         for subject, var in subjects.items():
                             if self.solver.Value(var):
                                 cell = {"subject": subject, "teacher": teacher, "grade": grade}
                                 break
                         if cell: break
                     if not cell:
-                        for teacher, var in self.flex[ck][d_idx][s_idx].items():
+                        for teacher, var in self.flex[ck][d_idx][slot_idx].items():
                             if self.solver.Value(var):
                                 cell = {"subject": self.FREE_PERIOD_LABEL, "teacher": teacher, "grade": grade}
                                 break
