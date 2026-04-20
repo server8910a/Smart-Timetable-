@@ -1,13 +1,7 @@
 import json
 import sys
-import time
-import random
-import math
-from collections import defaultdict, deque
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-
-# CORRECTED: lowercase 'import'
 from ortools.sat.python import cp_model
 
 app = Flask(__name__)
@@ -19,17 +13,13 @@ class TimetableSolver:
         self.config = config
         self.model = cp_model.CpModel()
         self.solver = None
-        self.diagnostics = []
 
-        # Parse configuration with type safety
+        # Parse configuration
         self.grades = [int(g) for g in config.get('grades', [])]
-        self.subjects = config.get('subjects', [])
+        self.subjects = [s[0] for s in config.get('subjects', [])]  # Extract subject names
         self.teachers = config.get('teachers', {})
         self.time_slots = config.get('timeSlots', [])
         self.working_days = config.get('workingDays', [])
-        self.class_requirements = config.get('classRequirements', {})
-        self.blacklist = config.get('blacklist', [])
-        self.subject_blacklist = config.get('subjectBlacklist', [])
         self.rules = config.get('rules', {})
         self.target_grades = config.get('targetGrades', self.grades)
         self.per_stream_enabled = self.rules.get('perStreamEnabled') == '1'
@@ -37,16 +27,15 @@ class TimetableSolver:
         self.grade_stream_names = config.get('gradeStreamNames', {})
         self.common_session = config.get('commonSession', {'enabled': False})
 
+        # Filter lesson slots
         self.lesson_slots = [s for s in self.time_slots if s.get('type') == 'lesson']
         self.num_slots = len(self.lesson_slots)
         self.num_days = len(self.working_days)
 
         self.global_max_per_day = int(self.rules.get('maxTeacherPerDay', 8))
-        self.NO_REPEAT = self.rules.get('ruleNoRepeat') == '1'
-        self.ENFORCE_MIN_PER_DAY = self.rules.get('ruleMinPerDay') == '1'
         self.FREE_PERIOD_LABEL = self.rules.get('freePeriodLabel', 'Free')
 
-        # Build class groups
+        # Build class groups (each stream is a separate class)
         self.class_groups = []
         for grade in self.target_grades:
             streams = self.grade_streams.get(str(grade), 1)
@@ -55,237 +44,230 @@ class TimetableSolver:
                 names = [f"Stream {i+1}" for i in range(streams)]
             for s_idx in range(streams):
                 stream_name = names[s_idx] if s_idx < len(names) else f"Stream {s_idx+1}"
-                self.class_groups.append((grade, s_idx, stream_name))
+                self.class_groups.append({
+                    'grade': grade,
+                    'stream_index': s_idx,
+                    'stream_name': stream_name,
+                    'key': f"{grade}_{s_idx}"
+                })
 
-        self._validate_assignments()
-        self.x = {}
-        self.flex = {}
+        # DEBUG: Print what we parsed
+        print(f"[DEBUG] Grades: {self.grades}", file=sys.stderr)
+        print(f"[DEBUG] Subjects: {self.subjects}", file=sys.stderr)
+        print(f"[DEBUG] Teachers: {list(self.teachers.keys())}", file=sys.stderr)
+        print(f"[DEBUG] Class groups: {len(self.class_groups)}", file=sys.stderr)
+        print(f"[DEBUG] Days: {self.working_days}, Slots per day: {self.num_slots}", file=sys.stderr)
+
+        # Create variables
+        self.x = {}  # x[class_key][day_idx][slot_idx][teacher][subject] = BoolVar
+        self.free = {}  # free[class_key][day_idx][slot_idx] = BoolVar
         self._create_variables()
 
-        self.teacher_total_vars = {t: self.model.NewIntVar(0, 1000, f'total_{t}') for t in self.teachers}
-        self.max_total = self.model.NewIntVar(0, 1000, 'max_total')
-        self.min_total = self.model.NewIntVar(0, 1000, 'min_total')
+        # DEBUG: Print variable counts
+        total_vars = 0
+        for cg in self.class_groups:
+            ck = cg['key']
+            for d in range(self.num_days):
+                for s in range(self.num_slots):
+                    for t in self.x[ck][d][s]:
+                        total_vars += len(self.x[ck][d][s][t])
+        print(f"[DEBUG] Total mandatory variables created: {total_vars}", file=sys.stderr)
 
-    def _validate_assignments(self):
-        errors = []
-        for (grade, s_idx, stream_name) in self.class_groups:
+        if total_vars == 0:
+            raise ValueError("No mandatory variables created. Check teacher assignments and per-stream settings.")
+
+        # Teacher total variables for fairness
+        self.teacher_total = {t: self.model.NewIntVar(0, 1000, f'total_{t}') for t in self.teachers}
+
+    def _create_variables(self):
+        for cg in self.class_groups:
+            ck = cg['key']
+            grade = cg['grade']
+            s_idx = cg['stream_index']
+
+            self.x[ck] = {}
+            self.free[ck] = {}
+
+            for d_idx in range(self.num_days):
+                self.x[ck][d_idx] = {}
+                self.free[ck][d_idx] = {}
+
+                for slot_idx in range(self.num_slots):
+                    self.x[ck][d_idx][slot_idx] = {}
+                    # Create free variable for EVERY slot
+                    self.free[ck][d_idx][slot_idx] = self.model.NewBoolVar(f'free_{ck}_{d_idx}_{slot_idx}')
+
+                    for teacher, t_data in self.teachers.items():
+                        self.x[ck][d_idx][slot_idx][teacher] = {}
+
+                        for assign in t_data.get('assignments', []):
+                            # Type-safe grade comparison
+                            assign_grade = int(assign.get('grade', 0))
+                            if assign_grade != int(grade):
+                                continue
+
+                            # Stream matching
+                            if self.per_stream_enabled and assign.get('streamIndex') is not None:
+                                assign_stream = int(assign.get('streamIndex', 0))
+                                if assign_stream != s_idx:
+                                    continue
+
+                            subject = assign.get('subject')
+                            if subject not in self.subjects:
+                                continue
+
+                            # Create variable for this specific assignment
+                            var = self.model.NewBoolVar(f'x_{ck}_{d_idx}_{slot_idx}_{teacher}_{subject}')
+                            self.x[ck][d_idx][slot_idx][teacher][subject] = var
+
+    def _get_required_lessons(self, grade, subject):
+        """Get required lessons for a grade/subject from teacher assignments."""
+        total = 0
+        for teacher, t_data in self.teachers.items():
+            for assign in t_data.get('assignments', []):
+                if int(assign.get('grade', 0)) == int(grade) and assign.get('subject') == subject:
+                    total += int(assign.get('lessons', 0))
+        return total
+
+    def _add_constraints(self):
+        # 1. EXACTLY ONE THING PER SLOT (lesson or free)
+        for cg in self.class_groups:
+            ck = cg['key']
+            for d in range(self.num_days):
+                for s in range(self.num_slots):
+                    vars_in_slot = [self.free[ck][d][s]]
+                    for teacher in self.x[ck][d][s]:
+                        vars_in_slot.extend(self.x[ck][d][s][teacher].values())
+                    self.model.Add(sum(vars_in_slot) == 1)
+
+        # 2. Teacher cannot be in two places at once
+        for teacher in self.teachers:
+            for d in range(self.num_days):
+                for s in range(self.num_slots):
+                    teacher_vars = []
+                    for cg in self.class_groups:
+                        ck = cg['key']
+                        if teacher in self.x[ck][d][s]:
+                            teacher_vars.extend(self.x[ck][d][s][teacher].values())
+                    if teacher_vars:
+                        self.model.Add(sum(teacher_vars) <= 1)
+
+        # 3. EXACT LESSON COUNT for each grade/subject
+        for cg in self.class_groups:
+            ck = cg['key']
+            grade = cg['grade']
             for subject in self.subjects:
                 required = self._get_required_lessons(grade, subject)
                 if required == 0:
                     continue
-                eligible = False
-                for teacher, t_data in self.teachers.items():
-                    if f"{teacher}|{grade}" in self.blacklist:
-                        continue
-                    if f"{subject}|{grade}" in self.subject_blacklist:
-                        continue
-                    for assign in t_data.get('assignments', []):
-                        # CRITICAL FIX: Type-safe grade comparison
-                        if int(assign.get('grade', 0)) != int(grade):
-                            continue
-                        if assign.get('subject') != subject:
-                            continue
-                        if self.per_stream_enabled and assign.get('streamIndex') is not None:
-                            if int(assign.get('streamIndex', 0)) != s_idx:
-                                continue
-                        eligible = True
-                        break
-                    if eligible:
-                        break
-                if not eligible:
-                    errors.append(f"Grade {grade} {stream_name} - {subject}: No eligible teacher")
-        if errors:
-            raise ValueError("Configuration errors:\n" + "\n".join(errors))
 
-    def _get_class_key(self, g, s):
-        return f"{g}_{s}"
+                subject_vars = []
+                for d in range(self.num_days):
+                    for s in range(self.num_slots):
+                        for teacher in self.x[ck][d][s]:
+                            if subject in self.x[ck][d][s][teacher]:
+                                subject_vars.append(self.x[ck][d][s][teacher][subject])
 
-    def _get_required_lessons(self, grade, subject):
-        key = f"{grade}|{subject}"
-        if key in self.class_requirements:
-            return self.class_requirements[key].get('requiredLessons', 0)
-        for subj in self.subjects:
-            if subj[0] == subject:
-                return subj[1].get('defaultLessons', 0)
-        return 0
+                if subject_vars:
+                    self.model.Add(sum(subject_vars) == required)
+                    print(f"[DEBUG] Grade {grade} {subject}: requiring {required} lessons, {len(subject_vars)} variables", file=sys.stderr)
+                else:
+                    print(f"[WARN] Grade {grade} {subject}: required {required} but 0 variables!", file=sys.stderr)
 
-    def _create_variables(self):
-        for (grade, s_idx, stream_name) in self.class_groups:
-            ck = self._get_class_key(grade, s_idx)
-            self.x[ck] = {}
-            self.flex[ck] = {}
-            for d_idx in range(self.num_days):
-                self.x[ck][d_idx] = {}
-                self.flex[ck][d_idx] = {}
-                for slot_idx in range(self.num_slots):
-                    self.x[ck][d_idx][slot_idx] = {}
-                    self.flex[ck][d_idx][slot_idx] = {}
-                    
-                    # Create flex variable for EVERY slot (forces exact one lesson/free per slot)
-                    self.flex[ck][d_idx][slot_idx] = self.model.NewBoolVar(f'flex_{ck}_{d_idx}_{slot_idx}')
-                    
-                    for teacher, t_data in self.teachers.items():
-                        for assign in t_data.get('assignments', []):
-                            # CRITICAL FIX: Type-safe grade comparison
-                            if int(assign.get('grade', 0)) != int(grade):
-                                continue
-                            # Handle stream index correctly
-                            if self.per_stream_enabled and assign.get('streamIndex') is not None:
-                                if int(assign.get('streamIndex', 0)) != s_idx:
-                                    continue
-                            subject = assign.get('subject')
-                            if f"{teacher}|{grade}" in self.blacklist:
-                                continue
-                            if f"{subject}|{grade}" in self.subject_blacklist:
-                                continue
-                            var = self.model.NewBoolVar(f'm_{ck}_{d_idx}_{slot_idx}_{teacher}_{subject}')
-                            if teacher not in self.x[ck][d_idx][slot_idx]:
-                                self.x[ck][d_idx][slot_idx][teacher] = {}
-                            self.x[ck][d_idx][slot_idx][teacher][subject] = var
-
-    def _add_constraints(self):
-        # CRITICAL FIX: EXACT EQUALITY for each slot
-        for (grade, s_idx, stream_name) in self.class_groups:
-            ck = self._get_class_key(grade, s_idx)
+        # 4. Teacher max per day
+        for teacher, t_data in self.teachers.items():
+            max_per_day = t_data.get('maxPerDay') or self.global_max_per_day
             for d in range(self.num_days):
-                for s in range(self.num_slots):
-                    vars_list = []
-                    # Add all teacher-subject variables
-                    for teacher_dict in self.x[ck][d][s].values():
-                        vars_list.extend(teacher_dict.values())
-                    # Add the flex variable
-                    vars_list.append(self.flex[ck][d][s])
-                    # EXACT EQUALITY: must have exactly one (lesson or free)
-                    self.model.Add(sum(vars_list) == 1)
+                day_vars = []
+                for cg in self.class_groups:
+                    ck = cg['key']
+                    for s in range(self.num_slots):
+                        if teacher in self.x[ck][d][s]:
+                            day_vars.extend(self.x[ck][d][s][teacher].values())
+                if day_vars:
+                    self.model.Add(sum(day_vars) <= max_per_day)
 
-        # Common session block
+        # 5. Teacher max weekly
+        for teacher, t_data in self.teachers.items():
+            if t_data.get('maxLessons'):
+                week_vars = []
+                for cg in self.class_groups:
+                    ck = cg['key']
+                    for d in range(self.num_days):
+                        for s in range(self.num_slots):
+                            if teacher in self.x[ck][d][s]:
+                                week_vars.extend(self.x[ck][d][s][teacher].values())
+                if week_vars:
+                    self.model.Add(sum(week_vars) <= t_data['maxLessons'])
+
+        # 6. Common session block
         if self.common_session.get('enabled'):
             day = self.common_session.get('day', 'FRI')
             slot_idx = self.common_session.get('slotIndex', 0)
             if day in self.working_days and slot_idx < self.num_slots:
                 d_idx = self.working_days.index(day)
-                for (grade, s_idx, stream_name) in self.class_groups:
-                    ck = self._get_class_key(grade, s_idx)
-                    # Force flex variable to be 1 (free period blocked for common session)
-                    self.model.Add(self.flex[ck][d_idx][slot_idx] == 1)
+                for cg in self.class_groups:
+                    ck = cg['key']
+                    # Force free variable to be 1 (meaning "Free" or common session)
+                    self.model.Add(self.free[ck][d_idx][slot_idx] == 1)
 
-        # Teacher cannot teach two classes at once
+        # 7. Link totals for fairness
         for teacher in self.teachers:
-            for d in range(self.num_days):
-                for s in range(self.num_slots):
-                    tv = []
-                    for (g, si, _) in self.class_groups:
-                        ck = self._get_class_key(g, si)
-                        if ck in self.x and d in self.x[ck] and s in self.x[ck][d] and teacher in self.x[ck][d][s]:
-                            tv.extend(self.x[ck][d][s][teacher].values())
-                    if tv:
-                        self.model.Add(sum(tv) <= 1)
-
-        # CRITICAL FIX: MANDATORY LESSONS EXACT COUNT (== not <=)
-        for (grade, s_idx, stream_name) in self.class_groups:
-            ck = self._get_class_key(grade, s_idx)
-            for subject in self.subjects:
-                required = self._get_required_lessons(grade, subject)
-                if required == 0:
-                    continue
-                vars_list = []
-                for d in range(self.num_days):
-                    for s in range(self.num_slots):
-                        for teacher in self.teachers:
-                            if teacher in self.x[ck][d][s] and subject in self.x[ck][d][s][teacher]:
-                                vars_list.append(self.x[ck][d][s][teacher][subject])
-                if vars_list:
-                    # EXACT EQUALITY: must place exactly the required number of lessons
-                    self.model.Add(sum(vars_list) == required)
-
-        # Teacher max weekly lessons
-        for teacher, t_data in self.teachers.items():
-            if t_data.get('maxLessons'):
-                vars_list = []
-                for (g, si, _) in self.class_groups:
-                    ck = self._get_class_key(g, si)
-                    for d in range(self.num_days):
-                        for s in range(self.num_slots):
-                            if teacher in self.x[ck][d][s]:
-                                vars_list.extend(self.x[ck][d][s][teacher].values())
-                if vars_list:
-                    self.model.Add(sum(vars_list) <= t_data['maxLessons'])
-
-        # Teacher max per day
-        for teacher, t_data in self.teachers.items():
-            max_per_day = t_data.get('maxPerDay') or self.global_max_per_day
-            for d_idx in range(self.num_days):
-                vars_list = []
-                for (g, si, _) in self.class_groups:
-                    ck = self._get_class_key(g, si)
-                    for s in range(self.num_slots):
-                        if teacher in self.x[ck][d_idx][s]:
-                            vars_list.extend(self.x[ck][d_idx][s][teacher].values())
-                if vars_list:
-                    self.model.Add(sum(vars_list) <= max_per_day)
-
-        # No back-to-back same subject (optional)
-        if self.NO_REPEAT:
-            for (grade, s_idx, stream_name) in self.class_groups:
-                ck = self._get_class_key(grade, s_idx)
-                for d in range(self.num_days):
-                    for s in range(self.num_slots - 1):
-                        for t1 in self.teachers:
-                            if t1 not in self.x[ck][d][s]:
-                                continue
-                            for subj, v1 in self.x[ck][d][s][t1].items():
-                                for t2 in self.teachers:
-                                    if t2 not in self.x[ck][d][s+1]:
-                                        continue
-                                    if subj in self.x[ck][d][s+1][t2]:
-                                        self.model.Add(v1 + self.x[ck][d][s+1][t2][subj] <= 1)
-
-        # Link total variables for fairness
-        for teacher in self.teachers:
-            vars_list = []
-            for (g, si, _) in self.class_groups:
-                ck = self._get_class_key(g, si)
+            week_vars = []
+            for cg in self.class_groups:
+                ck = cg['key']
                 for d in range(self.num_days):
                     for s in range(self.num_slots):
                         if teacher in self.x[ck][d][s]:
-                            vars_list.extend(self.x[ck][d][s][teacher].values())
-            if vars_list:
-                self.model.Add(self.teacher_total_vars[teacher] == sum(vars_list))
-
-        # Fairness bounds
-        totals = list(self.teacher_total_vars.values())
-        if totals:
-            self.model.AddMaxEquality(self.max_total, totals)
-            self.model.AddMinEquality(self.min_total, totals)
+                            week_vars.extend(self.x[ck][d][s][teacher].values())
+            if week_vars:
+                self.model.Add(self.teacher_total[teacher] == sum(week_vars))
 
     def solve(self):
         self._add_constraints()
-        self.model.Minimize(self.max_total - self.min_total)
+
+        # Objective: minimize difference between max and min teacher load
+        if len(self.teacher_total) > 1:
+            max_var = self.model.NewIntVar(0, 1000, 'max_total')
+            min_var = self.model.NewIntVar(0, 1000, 'min_total')
+            totals = list(self.teacher_total.values())
+            self.model.AddMaxEquality(max_var, totals)
+            self.model.AddMinEquality(min_var, totals)
+            self.model.Minimize(max_var - min_var)
+
         self.solver = cp_model.CpSolver()
         self.solver.parameters.max_time_in_seconds = 300.0
         self.solver.parameters.num_search_workers = 8
+
+        print(f"[DEBUG] Starting solver...", file=sys.stderr)
         status = self.solver.Solve(self.model)
+        print(f"[DEBUG] Solver status: {self.solver.StatusName(status)}", file=sys.stderr)
+
         if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             return self._extract_solution()
         return None
 
     def _extract_solution(self):
         timetable = {}
-        for (grade, s_idx, stream_name) in self.class_groups:
-            ck = self._get_class_key(grade, s_idx)
-            timetable[ck] = {"grade": grade, "streamIndex": s_idx, "streamName": stream_name, "days": {}}
+        for cg in self.class_groups:
+            ck = cg['key']
+            timetable[ck] = {
+                "grade": cg['grade'],
+                "streamIndex": cg['stream_index'],
+                "streamName": cg['stream_name'],
+                "days": {}
+            }
             for d_idx, day in enumerate(self.working_days):
                 timetable[ck]["days"][day] = []
                 for slot_idx in range(self.num_slots):
-                    # Check if flex variable is true (free period)
-                    if self.solver.Value(self.flex[ck][d_idx][slot_idx]):
+                    if self.solver.Value(self.free[ck][d_idx][slot_idx]):
                         timetable[ck]["days"][day].append(None)
                     else:
                         cell = None
                         for teacher, subjects in self.x[ck][d_idx][slot_idx].items():
                             for subject, var in subjects.items():
                                 if self.solver.Value(var):
-                                    cell = {"subject": subject, "teacher": teacher, "grade": grade}
+                                    cell = {"subject": subject, "teacher": teacher, "grade": cg['grade']}
                                     break
                             if cell:
                                 break
@@ -297,21 +279,14 @@ class TimetableSolver:
 def generate():
     try:
         config = request.json
+        print(f"[DEBUG] Received config with {len(config.get('grades', []))} grades", file=sys.stderr)
         solver = TimetableSolver(config)
         solution = solver.solve()
 
         if solution:
-            return jsonify({
-                "success": True,
-                "timetable": solution,
-                "diagnostics": solver.diagnostics
-            })
+            return jsonify({"success": True, "timetable": solution})
         else:
-            return jsonify({
-                "success": False,
-                "message": "No feasible timetable found. Check constraints or increase available slots.",
-                "diagnostics": solver.diagnostics
-            })
+            return jsonify({"success": False, "message": "No feasible timetable found. Check Render logs for details."})
     except ValueError as e:
         return jsonify({"success": False, "message": str(e)})
     except Exception as e:
