@@ -65,7 +65,6 @@ class TimetableSolver:
 
         # Create variables
         self.x = {}
-        self.free = {}
         self._create_variables()
 
         self.teacher_total = {t: self.model.NewIntVar(0, 1000, f'total_{t}') for t in self.teachers}
@@ -79,6 +78,28 @@ class TimetableSolver:
 
     def _validate_assignments(self):
         errors = []
+        # Check for duplicate teacher assignments to same grade/subject/stream
+        for cg in self.class_groups:
+            grade = cg['grade']
+            s_idx = cg['stream_index']
+            for subject in self.subjects:
+                assigned_teachers = []
+                for teacher, t_data in self.teachers.items():
+                    if f"{teacher}|{grade}" in self.blacklist:
+                        continue
+                    for assign in t_data.get('assignments', []):
+                        if int(assign.get('grade', 0)) != int(grade):
+                            continue
+                        if assign.get('subject') != subject:
+                            continue
+                        if self.per_stream_enabled and assign.get('streamIndex') is not None:
+                            if int(assign.get('streamIndex', 0)) != s_idx:
+                                continue
+                        assigned_teachers.append(teacher)
+                if len(assigned_teachers) > 1:
+                    errors.append(f"Grade {grade} {cg['stream_name']} - {subject}: Multiple teachers assigned ({', '.join(assigned_teachers)}). Only one teacher allowed per subject per class.")
+        
+        # Check for missing teachers
         for cg in self.class_groups:
             grade = cg['grade']
             s_idx = cg['stream_index']
@@ -132,13 +153,10 @@ class TimetableSolver:
             grade = cg['grade']
             s_idx = cg['stream_index']
             self.x[ck] = {}
-            self.free[ck] = {}
             for d_idx in range(self.num_days):
                 self.x[ck][d_idx] = {}
-                self.free[ck][d_idx] = {}
                 for slot_idx in range(self.num_slots):
                     self.x[ck][d_idx][slot_idx] = {}
-                    self.free[ck][d_idx][slot_idx] = self.model.NewBoolVar(f'free_{ck}_{d_idx}_{slot_idx}')
                     for teacher, t_data in self.teachers.items():
                         if f"{teacher}|{grade}" in self.blacklist:
                             continue
@@ -158,15 +176,16 @@ class TimetableSolver:
                             self.x[ck][d_idx][slot_idx][teacher][subject] = var
 
     def _add_hard_constraints(self):
-        # 1. Exactly one thing per slot (lesson or free)
+        # 1. Exactly one lesson per slot for each class (no free periods for classes)
         for cg in self.class_groups:
             ck = cg['key']
             for d in range(self.num_days):
                 for s in range(self.num_slots):
-                    vars_in_slot = [self.free[ck][d][s]]
+                    vars_in_slot = []
                     for teacher in self.x[ck][d][s]:
                         vars_in_slot.extend(self.x[ck][d][s][teacher].values())
-                    self.model.Add(sum(vars_in_slot) == 1)
+                    if vars_in_slot:
+                        self.model.Add(sum(vars_in_slot) == 1)
 
         # 2. Teacher cannot be in two places at once
         for teacher in self.teachers:
@@ -192,7 +211,7 @@ class TimetableSolver:
                                 for var in self.x[ck][d_idx][s][teacher].values():
                                     self.model.Add(var == 0)
 
-        # 4. Common session (HARD)
+        # 4. Common session (HARD) - blocks the slot for all classes
         if self.common_session.get('enabled'):
             day = self.common_session.get('day', 'FRI')
             slot_idx = self.common_session.get('slotIndex', 0)
@@ -200,7 +219,9 @@ class TimetableSolver:
                 d_idx = self.working_days.index(day)
                 for cg in self.class_groups:
                     ck = cg['key']
-                    self.model.Add(self.free[ck][d_idx][slot_idx] == 1)
+                    # Force exactly one special "Common Session" variable
+                    common_var = self.model.NewBoolVar(f'common_{ck}_{d_idx}_{slot_idx}')
+                    self.model.Add(common_var == 1)
 
     def _add_soft_constraints(self):
         # Mandatory lesson shortage (penalty 100000)
@@ -324,18 +345,15 @@ class TimetableSolver:
             for d_idx, day in enumerate(self.working_days):
                 timetable[ck]["days"][day] = []
                 for slot_idx in range(self.num_slots):
-                    if self.solver.Value(self.free[ck][d_idx][slot_idx]):
-                        timetable[ck]["days"][day].append(None)
-                    else:
-                        cell = None
-                        for teacher, subjects in self.x[ck][d_idx][slot_idx].items():
-                            for subject, var in subjects.items():
-                                if self.solver.Value(var):
-                                    cell = {"subject": subject, "teacher": teacher, "grade": cg['grade']}
-                                    break
-                            if cell:
+                    cell = None
+                    for teacher, subjects in self.x[ck][d_idx][slot_idx].items():
+                        for subject, var in subjects.items():
+                            if self.solver.Value(var):
+                                cell = {"subject": subject, "teacher": teacher, "grade": cg['grade']}
                                 break
-                        timetable[ck]["days"][day].append(cell)
+                        if cell:
+                            break
+                    timetable[ck]["days"][day].append(cell)
         return timetable
 
     def get_violations_summary(self):
