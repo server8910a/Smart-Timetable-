@@ -5,7 +5,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from ortools.sat.python import cp_model
 
-# Optional AI integration (Google Gemini)
+# Optional AI integration
 try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True
@@ -15,7 +15,6 @@ except ImportError:
 app = Flask(__name__)
 CORS(app)
 
-# Configure Gemini if API key is set
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 if GEMINI_API_KEY and GEMINI_AVAILABLE:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -28,9 +27,12 @@ class TimetableSolver:
         self.model = cp_model.CpModel()
         self.solver = None
         self.diagnostics = []
-        self.violations = []
+        self.violations = []  # Potential violations tracked during setup
 
-        # Parse configuration
+        # Store penalty variables with descriptions for post-solve analysis
+        self.penalty_vars = []  # List of (var, weight, description)
+
+        # Parse configuration (same as before)
         self.grades = [int(g) for g in config.get('grades', [])]
         self.subjects = [s[0] for s in config.get('subjects', [])]
         self.teachers = config.get('teachers', {})
@@ -76,11 +78,14 @@ class TimetableSolver:
         self.free = {}
         self._create_variables()
 
-        # Teacher total variables
         self.teacher_total = {t: self.model.NewIntVar(0, 1000, f'total_{t}') for t in self.teachers}
+        self.teacher_required = {t: self._calc_teacher_required(t) for t in self.teachers}
 
-        # Penalties
-        self.penalties = []
+    def _calc_teacher_required(self, teacher):
+        total = 0
+        for assign in self.teachers[teacher].get('assignments', []):
+            total += int(assign.get('lessons', 0))
+        return total
 
     def _validate_assignments(self):
         errors = []
@@ -89,46 +94,35 @@ class TimetableSolver:
             s_idx = cg['stream_index']
             for subject in self.subjects:
                 required = self._get_required_lessons(grade, subject)
-                if required == 0:
-                    continue
-                # Check blacklists
+                if required == 0: continue
                 if f"{subject}|{grade}" in self.subject_blacklist:
-                    errors.append(f"Grade {grade} {cg['stream_name']} - {subject}: Subject is blacklisted for this grade.")
+                    errors.append(f"Grade {grade} {cg['stream_name']} - {subject}: Subject is blacklisted")
                     continue
                 eligible = False
                 for teacher, t_data in self.teachers.items():
-                    if f"{teacher}|{grade}" in self.blacklist:
-                        continue
+                    if f"{teacher}|{grade}" in self.blacklist: continue
                     for assign in t_data.get('assignments', []):
-                        if int(assign.get('grade', 0)) != int(grade):
-                            continue
-                        if assign.get('subject') != subject:
-                            continue
+                        if int(assign.get('grade', 0)) != int(grade): continue
+                        if assign.get('subject') != subject: continue
                         if self.per_stream_enabled and assign.get('streamIndex') is not None:
-                            if int(assign.get('streamIndex', 0)) != s_idx:
-                                continue
+                            if int(assign.get('streamIndex', 0)) != s_idx: continue
                         eligible = True
                         break
-                    if eligible:
-                        break
+                    if eligible: break
                 if not eligible:
-                    errors.append(f"Grade {grade} {cg['stream_name']} - {subject}: No eligible teacher assigned (or all are blacklisted).")
+                    errors.append(f"Grade {grade} {cg['stream_name']} - {subject}: No eligible teacher")
         if errors:
             raise ValueError("Configuration errors:\n" + "\n".join(errors))
 
-    def _get_class_key(self, g, s):
-        return f"{g}_{s}"
+    def _get_class_key(self, g, s): return f"{g}_{s}"
 
     def _get_required_lessons(self, grade, subject):
         total = 0
         for teacher, t_data in self.teachers.items():
-            if f"{teacher}|{grade}" in self.blacklist:
-                continue
+            if f"{teacher}|{grade}" in self.blacklist: continue
             for assign in t_data.get('assignments', []):
-                if int(assign.get('grade', 0)) != int(grade):
-                    continue
-                if assign.get('subject') != subject:
-                    continue
+                if int(assign.get('grade', 0)) != int(grade): continue
+                if assign.get('subject') != subject: continue
                 total += int(assign.get('lessons', 0))
         return total
 
@@ -146,25 +140,20 @@ class TimetableSolver:
                     self.x[ck][d_idx][slot_idx] = {}
                     self.free[ck][d_idx][slot_idx] = self.model.NewBoolVar(f'free_{ck}_{d_idx}_{slot_idx}')
                     for teacher, t_data in self.teachers.items():
-                        if f"{teacher}|{grade}" in self.blacklist:
-                            continue
+                        if f"{teacher}|{grade}" in self.blacklist: continue
                         self.x[ck][d_idx][slot_idx][teacher] = {}
                         for assign in t_data.get('assignments', []):
-                            if int(assign.get('grade', 0)) != int(grade):
-                                continue
+                            if int(assign.get('grade', 0)) != int(grade): continue
                             if self.per_stream_enabled and assign.get('streamIndex') is not None:
-                                if int(assign.get('streamIndex', 0)) != s_idx:
-                                    continue
+                                if int(assign.get('streamIndex', 0)) != s_idx: continue
                             subject = assign.get('subject')
-                            if subject not in self.subjects:
-                                continue
-                            if f"{subject}|{grade}" in self.subject_blacklist:
-                                continue
+                            if subject not in self.subjects: continue
+                            if f"{subject}|{grade}" in self.subject_blacklist: continue
                             var = self.model.NewBoolVar(f'x_{ck}_{d_idx}_{slot_idx}_{teacher}_{subject}')
                             self.x[ck][d_idx][slot_idx][teacher][subject] = var
 
     def _add_hard_constraints(self):
-        # 1. EXACTLY ONE THING PER SLOT
+        # 1. One thing per slot
         for cg in self.class_groups:
             ck = cg['key']
             for d in range(self.num_days):
@@ -174,7 +163,7 @@ class TimetableSolver:
                         vars_in_slot.extend(self.x[ck][d][s][teacher].values())
                     self.model.Add(sum(vars_in_slot) == 1)
 
-        # 2. Teacher cannot be in two places at once
+        # 2. No double booking
         for teacher in self.teachers:
             for d in range(self.num_days):
                 for s in range(self.num_slots):
@@ -186,7 +175,7 @@ class TimetableSolver:
                     if teacher_vars:
                         self.model.Add(sum(teacher_vars) <= 1)
 
-        # 3. Unavailable days (HARD)
+        # 3. Unavailable days
         for teacher, t_data in self.teachers.items():
             unavail = set(t_data.get('unavailDays', []))
             for d_idx, day in enumerate(self.working_days):
@@ -198,7 +187,7 @@ class TimetableSolver:
                                 for var in self.x[ck][d_idx][s][teacher].values():
                                     self.model.Add(var == 0)
 
-        # 4. Common session (HARD)
+        # 4. Common session
         if self.common_session.get('enabled'):
             day = self.common_session.get('day', 'FRI')
             slot_idx = self.common_session.get('slotIndex', 0)
@@ -209,14 +198,13 @@ class TimetableSolver:
                     self.model.Add(self.free[ck][d_idx][slot_idx] == 1)
 
     def _add_soft_constraints(self):
-        # SOFT: Mandatory lesson count
+        # Mandatory lesson shortage (penalty weight 100000)
         for cg in self.class_groups:
             ck = cg['key']
             grade = cg['grade']
             for subject in self.subjects:
                 required = self._get_required_lessons(grade, subject)
-                if required == 0:
-                    continue
+                if required == 0: continue
                 subject_vars = []
                 for d in range(self.num_days):
                     for s in range(self.num_slots):
@@ -226,10 +214,9 @@ class TimetableSolver:
                 if subject_vars:
                     shortage = self.model.NewIntVar(0, required, f'shortage_{ck}_{subject}')
                     self.model.Add(sum(subject_vars) + shortage == required)
-                    self.penalties.append(shortage * 100000)
-                    self.violations.append(f"Grade {grade} {subject}: missing lessons")
+                    self.penalty_vars.append((shortage, 100000, f"Grade {grade} {cg['stream_name']}: Missing {subject} lessons"))
 
-        # SOFT: Teacher max per day
+        # Teacher daily overload (penalty 10000)
         for teacher, t_data in self.teachers.items():
             max_per_day = t_data.get('maxPerDay') or self.global_max_per_day
             for d in range(self.num_days):
@@ -242,10 +229,9 @@ class TimetableSolver:
                 if day_vars:
                     overload = self.model.NewIntVar(0, len(day_vars), f'overload_{teacher}_{d}')
                     self.model.Add(sum(day_vars) <= max_per_day + overload)
-                    self.penalties.append(overload * 10000)
-                    self.violations.append(f"{teacher} daily overload")
+                    self.penalty_vars.append((overload, 10000, f"{teacher}: Exceeded daily max on {self.working_days[d]}"))
 
-        # SOFT: Teacher max weekly
+        # Teacher weekly overload (penalty 20000)
         for teacher, t_data in self.teachers.items():
             if t_data.get('maxLessons'):
                 week_vars = []
@@ -258,29 +244,25 @@ class TimetableSolver:
                 if week_vars:
                     overload = self.model.NewIntVar(0, len(week_vars), f'week_overload_{teacher}')
                     self.model.Add(sum(week_vars) <= t_data['maxLessons'] + overload)
-                    self.penalties.append(overload * 20000)
-                    self.violations.append(f"{teacher} weekly overload")
+                    self.penalty_vars.append((overload, 20000, f"{teacher}: Exceeded weekly max"))
 
-        # SOFT: No back-to-back same subject
+        # Back-to-back same subject (penalty 2000)
         if self.NO_REPEAT:
             for cg in self.class_groups:
                 ck = cg['key']
                 for d in range(self.num_days):
                     for s in range(self.num_slots - 1):
                         for t1 in self.teachers:
-                            if t1 not in self.x[ck][d][s]:
-                                continue
+                            if t1 not in self.x[ck][d][s]: continue
                             for subj, v1 in self.x[ck][d][s][t1].items():
                                 for t2 in self.teachers:
-                                    if t2 not in self.x[ck][d][s+1]:
-                                        continue
+                                    if t2 not in self.x[ck][d][s+1]: continue
                                     if subj in self.x[ck][d][s+1][t2]:
                                         violation = self.model.NewBoolVar(f'btb_{ck}_{d}_{s}_{subj}')
                                         self.model.Add(v1 + self.x[ck][d][s+1][t2][subj] <= 1 + violation)
-                                        self.penalties.append(violation * 2000)
-                                        self.violations.append(f"Back-to-back {subj}")
+                                        self.penalty_vars.append((violation, 2000, f"Back-to-back {subj} in Grade {cg['grade']} {cg['stream_name']} on {self.working_days[d]}"))
 
-        # Link totals
+        # Link totals for fairness
         for teacher in self.teachers:
             week_vars = []
             for cg in self.class_groups:
@@ -307,7 +289,7 @@ class TimetableSolver:
         else:
             fairness_penalty = 0
 
-        total_penalty = sum(self.penalties) if self.penalties else 0
+        total_penalty = sum(v[1] * v[0] for v in self.penalty_vars) if self.penalty_vars else 0
         self.model.Minimize(fairness_penalty + total_penalty)
 
         self.solver = cp_model.CpSolver()
@@ -343,50 +325,50 @@ class TimetableSolver:
                                 if self.solver.Value(var):
                                     cell = {"subject": subject, "teacher": teacher, "grade": cg['grade']}
                                     break
-                            if cell:
-                                break
+                            if cell: break
                         timetable[ck]["days"][day].append(cell)
         return timetable
 
-    def get_ai_explanation(self):
-        """Generate human-readable explanation using Gemini."""
+    def get_violations_summary(self):
+        """Return a list of actual violations that occurred in the solution."""
+        violations = []
+        for var, weight, desc in self.penalty_vars:
+            val = self.solver.Value(var)
+            if val > 0:
+                violations.append({
+                    "description": desc,
+                    "severity": "High" if weight >= 100000 else "Medium" if weight >= 10000 else "Low",
+                    "value": val
+                })
+        return violations
+
+    def get_ai_explanation(self, violations=None):
         if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
-            return "AI explanation unavailable (Gemini not configured)."
+            return "AI explanation unavailable."
 
         summary = {
             "grades": len(self.grades),
             "subjects": len(self.subjects),
             "teachers": len(self.teachers),
-            "total_required_lessons": sum(self._get_required_lessons(g, s) for g in self.grades for s in self.subjects),
-            "total_available_slots": len(self.class_groups) * self.num_days * self.num_slots,
-            "teacher_workloads": {t: self.teacher_required[t] for t in self.teachers},
-            "blacklisted_combinations": len(self.blacklist) + len(self.subject_blacklist),
-            "violations_considered": list(set(self.violations))[:5]
+            "total_required": sum(self._get_required_lessons(g, s) for g in self.grades for s in self.subjects),
+            "total_slots": len(self.class_groups) * self.num_days * self.num_slots,
+            "violations": violations if violations else []
         }
 
         prompt = f"""
-You are an expert school timetabling consultant. A user tried to generate a timetable with the following configuration, but it was infeasible (or had to break rules). Explain in simple terms why it's difficult and suggest specific actions to fix it.
+A school timetable was generated with the following soft constraint violations:
+{json.dumps(summary['violations'], indent=2)}
 
-Configuration:
-- Grades: {summary['grades']}
-- Subjects: {summary['subjects']}
-- Teachers: {summary['teachers']}
-- Total required lessons: {summary['total_required_lessons']}
-- Total available slots (all classes): {summary['total_available_slots']}
-- Teacher workloads (lessons/week): {summary['teacher_workloads']}
-- Blacklisted combinations: {summary['blacklisted_combinations']}
-- Potential violations that had to be penalized: {summary['violations_considered']}
+Total required lessons: {summary['total_required']}, total available slots: {summary['total_slots']}.
+Grades: {summary['grades']}, Subjects: {summary['subjects']}, Teachers: {summary['teachers']}.
 
-Provide a concise, helpful response (max 200 words) that:
-1. Identifies the main bottleneck (e.g., overloaded teachers, not enough slots).
-2. Suggests 2-3 actionable fixes (e.g., reduce lessons for specific subjects, add another teacher, increase days).
-3. Mentions if any blacklists are causing issues.
+Provide a brief, professional explanation of why these violations occurred and suggest 1-2 practical adjustments to eliminate them in future generations.
 """
         try:
             response = ai_model.generate_content(prompt)
             return response.text
         except Exception as e:
-            return f"AI explanation failed: {str(e)}"
+            return f"AI explanation error: {str(e)}"
 
 
 @app.route('/generate', methods=['POST'])
@@ -397,14 +379,22 @@ def generate():
         solution = solver.solve()
 
         if solution:
-            return jsonify({"success": True, "timetable": solution})
+            violations = solver.get_violations_summary()
+            ai_explanation = None
+            if violations and GEMINI_AVAILABLE:
+                ai_explanation = solver.get_ai_explanation(violations)
+            return jsonify({
+                "success": True,
+                "timetable": solution,
+                "violations": violations,
+                "ai_explanation": ai_explanation
+            })
         else:
             ai_msg = solver.get_ai_explanation() if GEMINI_AVAILABLE else None
             return jsonify({
                 "success": False,
-                "message": "No feasible timetable found.",
-                "ai_explanation": ai_msg,
-                "violations": solver.violations
+                "message": "No feasible timetable found even with soft constraints.",
+                "ai_explanation": ai_msg
             })
     except ValueError as e:
         return jsonify({"success": False, "message": str(e)})
