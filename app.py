@@ -35,7 +35,6 @@ class TimetableSolver:
         self.subject_blacklist = set(config.get('subjectBlacklist', []))
         self.rules = config.get('rules', {})
         self.target_grades = config.get('targetGrades', self.grades)
-        self.per_stream_enabled = self.rules.get('perStreamEnabled') == '1'
         self.grade_streams = config.get('gradeStreams', {})
         self.grade_stream_names = config.get('gradeStreamNames', {})
         self.common_session = config.get('commonSession', {'enabled': False})
@@ -131,10 +130,9 @@ class TimetableSolver:
                                 continue
                             
                             # Check stream-specific assignment
-                            if self.per_stream_enabled:
-                                assign_stream = assign.get('streamIndex')
-                                if assign_stream is not None and int(assign_stream) != s_idx:
-                                    continue
+                            assign_stream = assign.get('streamIndex')
+                            if assign_stream is not None and int(assign_stream) != s_idx:
+                                continue
                             
                             subject = assign.get('subject')
                             if not subject:
