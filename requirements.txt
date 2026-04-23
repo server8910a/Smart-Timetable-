@@ -1,4 +1,4 @@
 Flask==2.3.3
 flask-cors==4.0.0
-ortools==9.15.6755
+ortools==9.10.4067
 gunicorn==21.2.0
