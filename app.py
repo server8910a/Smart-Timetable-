@@ -1,7 +1,7 @@
 """
 EduSchedule Pro Backend
 Advanced Timetable Generator with OR-Tools CP-SAT Solver
-Production-ready with multiple independent, specific, and actionable suggestions
+Production-ready with intelligent, specific, and actionable suggestions
 """
 
 import json
@@ -10,7 +10,7 @@ import time
 import logging
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple, Optional, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 from flask import Flask, request, jsonify
@@ -461,429 +461,303 @@ class TimetableSolver:
 
     def _analyze_infeasibility(self) -> List[Suggestion]:
         """
-        Analyze why the timetable is infeasible and suggest MULTIPLE independent solutions.
-        ANY SINGLE suggestion should be able to solve the problem on its own.
+        Exhaustive analysis of why the timetable is infeasible.
+        Checks hard constraints first, then soft constraints.
+        Each suggestion is a complete, independent solution.
         """
         suggestions: List[Suggestion] = []
         
         try:
-            # Track detailed statistics
-            teacher_subject_totals: Dict[str, Dict[str, int]] = defaultdict(
-                lambda: defaultdict(int)
-            )
-            teacher_grade_totals: Dict[str, Dict[int, int]] = defaultdict(
-                lambda: defaultdict(int)
-            )
-            subject_grade_totals: Dict[str, Dict[int, int]] = defaultdict(
-                lambda: defaultdict(int)
-            )
-            teacher_assigned_subjects: Dict[str, Set[str]] = defaultdict(set)
+            logger.info(f"Starting infeasibility analysis: {len(self.class_groups)} classes, "
+                       f"{len(self.teachers)} teachers, {len(self.subjects)} subjects")
             
-            # Build teacher assigned subjects map
+            # Pre-compute teacher availability
+            teacher_availability = {}
             for teacher, t_data in self.teachers.items():
-                for assign in t_data.get('assignments', []):
-                    teacher_assigned_subjects[teacher].add(assign.get('subject'))
+                unavail = set(t_data.get('unavailDays', []))
+                teacher_availability[teacher] = [d for d in self.working_days if d not in unavail]
             
-            # Calculate total required vs available
-            total_required = 0
-            total_available = len(self.class_groups) * self.num_days * self.num_slots
+            # =========================================================================
+            # PHASE 1: HARD CONSTRAINT CONFLICTS (These make the problem impossible)
+            # =========================================================================
             
             for cg in self.class_groups:
                 grade = cg['grade']
+                stream_idx = cg['stream_index']
+                stream_name = cg['stream_name']
+                
                 for subject in self.subjects:
-                    req = self._get_required_lessons(grade, subject)
-                    total_required += req
-                    subject_grade_totals[subject][grade] = req
+                    required = self._get_required_lessons(grade, subject)
+                    if required == 0:
+                        continue
+                    
+                    # Find eligible teachers for this grade/stream/subject
+                    eligible_teachers = []
+                    teacher_available_slots = {}
                     
                     for teacher, t_data in self.teachers.items():
+                        # Check blacklist
                         if f"{teacher}|{grade}" in self.blacklist:
                             continue
+                        # Check subject blacklist
+                        if f"{subject}|{grade}" in self.subject_blacklist:
+                            continue
+                        
+                        # Check if teacher is assigned to this subject for this grade/stream
+                        teaches_this = False
                         for assign in t_data.get('assignments', []):
-                            if int(assign.get('grade', 0)) == grade and \
-                               assign.get('subject') == subject:
-                                lessons = int(assign.get('lessons', 0))
-                                teacher_subject_totals[teacher][subject] += lessons
-                                teacher_grade_totals[teacher][grade] += lessons
-            
-            # =========================================================================
-            # ISSUE 1: CAPACITY OVERLOAD
-            # Each suggestion is a COMPLETE, INDEPENDENT solution
-            # =========================================================================
-            if total_required > total_available:
-                shortage = total_required - total_available
-                slots_per_day = self.num_slots
-                days = self.num_days
-                classes_count = len(self.class_groups)
-                
-                subject_totals: Dict[str, int] = {}
-                for subject in self.subjects:
-                    subject_totals[subject] = sum(
-                        subject_grade_totals[subject].values()
-                    )
-                
-                high_volume_subjects = sorted(
-                    subject_totals.items(), key=lambda x: x[1], reverse=True
-                )[:3]
-                subject_names = [s[0] for s in high_volume_subjects]
-                
-                # Suggestion 1: Reduce specific subject lessons (COMPLETE SOLUTION)
-                reduce_amounts = []
-                remaining = shortage
-                for subject, total in high_volume_subjects:
-                    if remaining <= 0:
-                        break
-                    reduction = min(total, remaining)
-                    reduce_amounts.append(f"{subject} by {reduction}")
-                    remaining -= reduction
-                
-                if reduce_amounts:
-                    suggestions.append(Suggestion(
-                        type="capacity_reduce_lessons",
-                        message=f"SOLUTION 1: Reduce lessons to fit within {total_available} slots.",
-                        fixes=[
-                            f"Reduce {', '.join(reduce_amounts)}. This will free exactly {shortage} slots.",
-                            f"After this change, total required lessons will be {total_available} (within capacity)."
-                        ]
-                    ))
-                
-                # Suggestion 2: Remove/combine streams (COMPLETE SOLUTION)
-                streams_to_remove = (shortage // (days * slots_per_day)) + 1
-                suggestions.append(Suggestion(
-                    type="capacity_remove_streams",
-                    message=f"SOLUTION 2: Remove or combine {streams_to_remove} stream(s).",
-                    fixes=[
-                        f"Remove {streams_to_remove} stream(s) from any grade. "
-                        f"This will free {streams_to_remove * days * slots_per_day} slots.",
-                        f"After this change, capacity will be sufficient."
-                    ]
-                ))
-                
-                # Suggestion 3: Add working day (COMPLETE SOLUTION)
-                slots_added = classes_count * slots_per_day
-                suggestions.append(Suggestion(
-                    type="capacity_add_day",
-                    message=f"SOLUTION 3: Add an extra working day.",
-                    fixes=[
-                        f"Add 1 more working day (currently {days} days).",
-                        f"This will add {slots_added} slots, more than enough to cover the {shortage} shortage.",
-                        f"After this change, total capacity will be {total_available + slots_added} slots."
-                    ]
-                ))
-            
-            # =========================================================================
-            # ISSUE 2: TEACHER OVERLOAD
-            # Each suggestion is a COMPLETE, INDEPENDENT solution
-            # =========================================================================
-            for teacher, t_data in self.teachers.items():
-                teacher_required = sum(teacher_subject_totals[teacher].values())
-                max_weekly = t_data.get('maxLessons')
-                
-                if max_weekly and teacher_required > max_weekly:
-                    overload = teacher_required - max_weekly
-                    teacher_subjects = list(teacher_subject_totals[teacher].keys())
-                    
-                    # Find other teachers who teach the SAME subjects and have capacity
-                    available_teachers = []
-                    for other_teacher, other_data in self.teachers.items():
-                        if other_teacher == teacher:
-                            continue
-                        other_subjects = teacher_assigned_subjects[other_teacher]
-                        if not other_subjects.intersection(teacher_subjects):
-                            continue
-                        other_required = sum(
-                            teacher_subject_totals[other_teacher].values()
-                        )
-                        other_max = other_data.get('maxLessons')
-                        if other_max and other_required < other_max:
-                            available_teachers.append({
-                                'name': other_teacher,
-                                'capacity': other_max - other_required,
-                                'subjects': list(other_subjects.intersection(teacher_subjects))
-                            })
-                    
-                    # Suggestion 1: Reduce lessons (COMPLETE SOLUTION)
-                    specific_reductions = []
-                    remaining = overload
-                    for subject in teacher_subjects:
-                        if remaining <= 0:
-                            break
-                        current = teacher_subject_totals[teacher][subject]
-                        reduction = min(current, remaining)
-                        specific_reductions.append(f"{subject} by {reduction}")
-                        remaining -= reduction
-                    
-                    suggestions.append(Suggestion(
-                        type="teacher_overload_reduce",
-                        message=f"SOLUTION 1 for {teacher}: Reduce assigned lessons.",
-                        fixes=[
-                            f"Reduce {teacher}'s lessons by {overload} total.",
-                            f"Specifically, reduce {', '.join(specific_reductions)}.",
-                            f"This brings {teacher} from {teacher_required} to {max_weekly} lessons.",
-                            f"This is a COMPLETE solution - no other changes needed."
-                        ],
-                        metadata={"teacher": teacher}
-                    ))
-                    
-                    # Suggestion 2: Reassign to specific teachers (COMPLETE SOLUTION)
-                    if available_teachers:
-                        best_teacher = available_teachers[0]
-                        suggestions.append(Suggestion(
-                            type="teacher_overload_reassign",
-                            message=f"SOLUTION 2 for {teacher}: Reassign lessons to {best_teacher['name']}.",
-                            fixes=[
-                                f"Reassign {overload} lessons from {teacher} to {best_teacher['name']}.",
-                                f"{best_teacher['name']} teaches {', '.join(best_teacher['subjects'][:2])} "
-                                f"and has capacity for {best_teacher['capacity']} more lessons.",
-                                f"This is a COMPLETE solution - no other changes needed."
-                            ],
-                            metadata={"teacher": teacher}
-                        ))
-                    
-                    # Suggestion 3: Increase max lessons (COMPLETE SOLUTION)
-                    suggestions.append(Suggestion(
-                        type="teacher_overload_increase_max",
-                        message=f"SOLUTION 3 for {teacher}: Increase weekly maximum.",
-                        fixes=[
-                            f"Increase {teacher}'s weekly maximum from {max_weekly} to {teacher_required}.",
-                            f"This is a COMPLETE solution - no other changes needed."
-                        ],
-                        metadata={"teacher": teacher}
-                    ))
-            
-            # =========================================================================
-            # ISSUE 3: DAILY LIMIT VIOLATION
-            # =========================================================================
-            for teacher, t_data in self.teachers.items():
-                teacher_required = sum(teacher_subject_totals[teacher].values())
-                max_per_day = t_data.get('maxPerDay', self.global_max_per_day)
-                unavail_days = len(set(t_data.get('unavailDays', [])))
-                available_days = self.num_days - unavail_days
-                
-                if available_days > 0 and teacher_required > 0:
-                    daily_needed = teacher_required / available_days
-                    if daily_needed > max_per_day:
-                        suggested_max = int(daily_needed) + 1
-                        reduction_needed = teacher_required - (max_per_day * available_days)
-                        
-                        # Suggestion 1: Increase daily max (COMPLETE SOLUTION)
-                        suggestions.append(Suggestion(
-                            type="daily_limit_increase",
-                            message=f"SOLUTION 1 for {teacher}: Increase daily maximum.",
-                            fixes=[
-                                f"Increase {teacher}'s daily maximum from {max_per_day} to {suggested_max}.",
-                                f"Currently {teacher} needs to teach {daily_needed:.1f} lessons per available day.",
-                                f"This is a COMPLETE solution - no other changes needed."
-                            ],
-                            metadata={"teacher": teacher}
-                        ))
-                        
-                        # Suggestion 2: Reduce total lessons (COMPLETE SOLUTION)
-                        if reduction_needed > 0:
-                            suggestions.append(Suggestion(
-                                type="daily_limit_reduce",
-                                message=f"SOLUTION 2 for {teacher}: Reduce total lessons.",
-                                fixes=[
-                                    f"Reduce {teacher}'s total lessons by {reduction_needed} "
-                                    f"(from {teacher_required} to {max_per_day * available_days}).",
-                                    f"This is a COMPLETE solution - no other changes needed."
-                                ],
-                                metadata={"teacher": teacher}
-                            ))
-                        
-                        # Suggestion 3: Reduce unavailable days (COMPLETE SOLUTION)
-                        if unavail_days > 0:
-                            days_to_remove = min(unavail_days, 
-                                               int((teacher_required / max_per_day) - available_days) + 1)
-                            suggestions.append(Suggestion(
-                                type="daily_limit_availability",
-                                message=f"SOLUTION 3 for {teacher}: Reduce unavailable days.",
-                                fixes=[
-                                    f"Reduce {teacher}'s unavailable days by {days_to_remove} "
-                                    f"(currently {unavail_days} days off).",
-                                    f"This increases available days to {available_days + days_to_remove}, "
-                                    f"reducing daily load to {teacher_required / (available_days + days_to_remove):.1f}.",
-                                    f"This is a COMPLETE solution - no other changes needed."
-                                ],
-                                metadata={"teacher": teacher}
-                            ))
-            
-            # =========================================================================
-            # ISSUE 4: UNASSIGNED SUBJECTS
-            # =========================================================================
-            for subject in self.subjects:
-                teachers_for_subject = [t for t, subs in teacher_subject_totals.items() 
-                                       if subject in subs]
-                if len(teachers_for_subject) == 0:
-                    total_needed = sum(subject_grade_totals[subject].values())
-                    if total_needed > 0:
-                        # Find teachers with capacity
-                        available_teachers = []
-                        for other_teacher, other_data in self.teachers.items():
-                            other_required = sum(
-                                teacher_subject_totals[other_teacher].values()
-                            )
-                            other_max = other_data.get('maxLessons')
-                            if other_max and other_required < other_max:
-                                available_teachers.append({
-                                    'name': other_teacher,
-                                    'capacity': other_max - other_required
-                                })
-                        
-                        # Suggestion 1: Assign to existing teacher (COMPLETE SOLUTION)
-                        if available_teachers:
-                            best_teacher = available_teachers[0]
-                            suggestions.append(Suggestion(
-                                type="unassigned_assign_existing",
-                                message=f"SOLUTION 1 for {subject}: Assign to {best_teacher['name']}.",
-                                fixes=[
-                                    f"Assign {best_teacher['name']} to teach {subject}.",
-                                    f"{best_teacher['name']} has capacity for {best_teacher['capacity']} "
-                                    f"more lessons and can take the {total_needed} needed.",
-                                    f"This is a COMPLETE solution - no other changes needed."
-                                ],
-                                metadata={"subject": subject}
-                            ))
-                        
-                        # Suggestion 2: Remove subject (COMPLETE SOLUTION)
-                        suggestions.append(Suggestion(
-                            type="unassigned_remove_subject",
-                            message=f"SOLUTION 2 for {subject}: Remove subject from curriculum.",
-                            fixes=[
-                                f"Remove {subject} from all grades (requires {total_needed} lessons).",
-                                f"This is a COMPLETE solution - no other changes needed."
-                            ],
-                            metadata={"subject": subject}
-                        ))
-                        
-                        # Suggestion 3: Add new teacher (COMPLETE SOLUTION)
-                        suggestions.append(Suggestion(
-                            type="unassigned_add_teacher",
-                            message=f"SOLUTION 3 for {subject}: Add a new teacher.",
-                            fixes=[
-                                f"Add a new teacher qualified to teach {subject}.",
-                                f"The new teacher should be assigned {total_needed} lessons of {subject}.",
-                                f"This is a COMPLETE solution - no other changes needed."
-                            ],
-                            metadata={"subject": subject}
-                        ))
-            
-            # =========================================================================
-            # ISSUE 5: SUBJECT-GRADE MISMATCH (Grade needs subject but no teacher)
-            # =========================================================================
-            for subject in self.subjects:
-                for grade in self.grades:
-                    needed = subject_grade_totals[subject].get(grade, 0)
-                    if needed > 0:
-                        # Check if any teacher is assigned to this subject for this grade
-                        has_teacher = False
-                        for teacher, t_data in self.teachers.items():
-                            for assign in t_data.get('assignments', []):
-                                if (assign.get('grade') == grade and 
-                                    assign.get('subject') == subject):
-                                    has_teacher = True
-                                    break
-                            if has_teacher:
+                            if (assign.get('grade') == grade and 
+                                assign.get('subject') == subject):
+                                # Stream check
+                                assign_stream = assign.get('streamIndex')
+                                if assign_stream is not None and assign_stream != stream_idx:
+                                    continue
+                                teaches_this = True
                                 break
                         
-                        if not has_teacher:
-                            # Find teachers who teach this subject
-                            subject_teachers = [
-                                t for t, subs in teacher_assigned_subjects.items() 
-                                if subject in subs
-                            ]
-                            
-                            if subject_teachers:
-                                # Suggestion 1: Extend existing teacher to this grade
-                                best_teacher = subject_teachers[0]
+                        if not teaches_this:
+                            continue
+                        
+                        eligible_teachers.append(teacher)
+                        avail_days = teacher_availability.get(teacher, [])
+                        teacher_available_slots[teacher] = len(avail_days) * self.num_slots
+                    
+                    # Conflict 1: No eligible teacher at all
+                    if not eligible_teachers:
+                        suggestions.append(Suggestion(
+                            type="hard_no_teacher",
+                            message=f"Grade {grade} {stream_name} needs {required} lessons of {subject}, "
+                                    f"but NO teacher is assigned to teach it.",
+                            fixes=[
+                                f"Assign a teacher to teach {subject} for Grade {grade} {stream_name}",
+                                f"Remove {subject} requirement for this class",
+                                f"Check if {subject} is blacklisted for Grade {grade}"
+                            ],
+                            metadata={"grade": grade, "subject": subject, "stream": stream_name}
+                        ))
+                        continue
+                    
+                    # Conflict 2: Total available slots from all eligible teachers < required
+                    total_available = sum(teacher_available_slots.values())
+                    if total_available < required:
+                        suggestions.append(Suggestion(
+                            type="hard_insufficient_slots",
+                            message=f"Grade {grade} {stream_name} needs {required} lessons of {subject}, "
+                                    f"but eligible teachers have only {total_available} total available slots.",
+                            fixes=[
+                                f"PRIMARY: Reduce required lessons for {subject} to {total_available}",
+                                f"Increase teacher availability (reduce unavailable days)",
+                                f"LAST RESORT: Add another teacher for {subject}"
+                            ],
+                            metadata={"grade": grade, "subject": subject, "available": total_available, "required": required}
+                        ))
+                    
+                    # Conflict 3: Daily slot capacity per subject per class
+                    max_slots_per_day = self.num_slots
+                    if required > self.num_days * max_slots_per_day:
+                        suggestions.append(Suggestion(
+                            type="hard_daily_capacity",
+                            message=f"Grade {grade} {stream_name} needs {required} lessons of {subject}, "
+                                    f"but maximum possible per week is {self.num_days * max_slots_per_day}.",
+                            fixes=[
+                                f"PRIMARY: Reduce {subject} lessons to at most {self.num_days * max_slots_per_day}",
+                                f"LAST RESORT: Add more lesson slots per day or extra working day"
+                            ],
+                            metadata={"grade": grade, "subject": subject}
+                        ))
+            
+            # Conflict 4: Teacher completely unavailable but assigned lessons
+            for teacher, t_data in self.teachers.items():
+                avail_days = teacher_availability.get(teacher, [])
+                if not avail_days:
+                    total_assigned = 0
+                    for grade in self.grades:
+                        for subject in self.subjects:
+                            for assign in t_data.get('assignments', []):
+                                if assign.get('grade') == grade and assign.get('subject') == subject:
+                                    total_assigned += assign.get('lessons', 0)
+                    
+                    if total_assigned > 0:
+                        suggestions.append(Suggestion(
+                            type="teacher_never_available",
+                            message=f"{teacher} is assigned {total_assigned} lessons but is unavailable on all days.",
+                            fixes=[
+                                f"PRIMARY: Remove unavailable days for {teacher}",
+                                f"Reassign all {teacher}'s lessons to other teachers",
+                                f"LAST RESORT: Remove {teacher}'s assignments"
+                            ],
+                            metadata={"teacher": teacher, "lessons": total_assigned}
+                        ))
+            
+            # Conflict 5: Common session reduces available slots below requirement
+            if self.common_session.get('enabled'):
+                session_day = self.common_session.get('day', 'FRI')
+                session_slot = int(self.common_session.get('slotIndex', 0))
+                if session_day in self.working_days and session_slot < self.num_slots:
+                    effective_slots_per_week = self.num_days * self.num_slots - 1
+                    for cg in self.class_groups:
+                        grade = cg['grade']
+                        for subject in self.subjects:
+                            required = self._get_required_lessons(grade, subject)
+                            if required > effective_slots_per_week:
                                 suggestions.append(Suggestion(
-                                    type="grade_subject_assign",
-                                    message=f"SOLUTION: Assign {best_teacher} to teach {subject} for Grade {grade}.",
+                                    type="common_session_conflict",
+                                    message=f"Grade {grade} {cg['stream_name']} needs {required} lessons of {subject}, "
+                                            f"but only {effective_slots_per_week} slots available (common session takes one).",
                                     fixes=[
-                                        f"Extend {best_teacher}'s {subject} assignment to include Grade {grade}.",
-                                        f"Add {needed} lessons for Grade {grade} to {best_teacher}'s workload.",
-                                        f"This is a COMPLETE solution - no other changes needed."
+                                        f"PRIMARY: Reduce {subject} lessons to {effective_slots_per_week}",
+                                        f"Disable common session or move to a break slot",
+                                        f"LAST RESORT: Add an extra working day"
                                     ],
-                                    metadata={"subject": subject, "grade": grade}
-                                ))
-                            else:
-                                # Suggestion 2: Remove requirement
-                                suggestions.append(Suggestion(
-                                    type="grade_subject_remove",
-                                    message=f"SOLUTION: Remove {subject} requirement for Grade {grade}.",
-                                    fixes=[
-                                        f"Remove the {needed} lessons of {subject} from Grade {grade}.",
-                                        f"This is a COMPLETE solution - no other changes needed."
-                                    ],
-                                    metadata={"subject": subject, "grade": grade}
+                                    metadata={"grade": grade, "subject": subject}
                                 ))
             
-            # =========================================================================
-            # ISSUE 6: BLACKLIST CONFLICTS
-            # =========================================================================
+            # Conflict 6: Blacklist contradictions (teacher assigned but blacklisted)
             for teacher, t_data in self.teachers.items():
                 for grade in self.grades:
                     if f"{teacher}|{grade}" in self.blacklist:
-                        if teacher_grade_totals[teacher].get(grade, 0) > 0:
-                            lessons = teacher_grade_totals[teacher][grade]
-                            
-                            # Suggestion 1: Remove blacklist (COMPLETE SOLUTION)
+                        assigned_lessons = 0
+                        for assign in t_data.get('assignments', []):
+                            if assign.get('grade') == grade:
+                                assigned_lessons += assign.get('lessons', 0)
+                        
+                        if assigned_lessons > 0:
                             suggestions.append(Suggestion(
-                                type="blacklist_remove",
-                                message=f"SOLUTION 1: Remove blacklist for {teacher} on Grade {grade}.",
+                                type="blacklist_contradiction",
+                                message=f"{teacher} is blacklisted from Grade {grade} but has {assigned_lessons} lessons assigned.",
                                 fixes=[
-                                    f"Remove the blacklist blocking {teacher} from Grade {grade}.",
-                                    f"This allows the {lessons} already-assigned lessons to proceed.",
-                                    f"This is a COMPLETE solution - no other changes needed."
+                                    f"PRIMARY: Remove the blacklist for {teacher} on Grade {grade}",
+                                    f"Reassign {teacher}'s Grade {grade} lessons to another teacher",
+                                    f"LAST RESORT: Remove {teacher}'s assignments for Grade {grade}"
                                 ],
                                 metadata={"teacher": teacher, "grade": grade}
                             ))
-                            
-                            # Suggestion 2: Reassign lessons (COMPLETE SOLUTION)
-                            # Find alternative teachers
-                            alt_teachers = []
-                            for other_teacher in self.teachers:
-                                if other_teacher == teacher:
-                                    continue
-                                if f"{other_teacher}|{grade}" in self.blacklist:
-                                    continue
-                                # Check if other teacher teaches any of the same subjects
-                                for assign in t_data.get('assignments', []):
-                                    if assign.get('grade') == grade:
-                                        subject = assign.get('subject')
-                                        if subject in teacher_assigned_subjects.get(other_teacher, set()):
-                                            alt_teachers.append(other_teacher)
-                                            break
-                            
-                            if alt_teachers:
-                                suggestions.append(Suggestion(
-                                    type="blacklist_reassign",
-                                    message=f"SOLUTION 2: Reassign {teacher}'s Grade {grade} lessons.",
-                                    fixes=[
-                                        f"Reassign {teacher}'s {lessons} lessons for Grade {grade} to {alt_teachers[0]}.",
-                                        f"{alt_teachers[0]} is qualified and not blacklisted from Grade {grade}.",
-                                        f"This is a COMPLETE solution - no other changes needed."
-                                    ],
-                                    metadata={"teacher": teacher, "grade": grade}
-                                ))
-                            
-                            # Suggestion 3: Remove assignments (COMPLETE SOLUTION)
-                            suggestions.append(Suggestion(
-                                type="blacklist_remove_assignments",
-                                message=f"SOLUTION 3: Remove {teacher}'s assignments for Grade {grade}.",
-                                fixes=[
-                                    f"Remove {teacher}'s {lessons} lesson assignments for Grade {grade}.",
-                                    f"This resolves the blacklist conflict.",
-                                    f"This is a COMPLETE solution - no other changes needed."
-                                ],
-                                metadata={"teacher": teacher, "grade": grade}
-                            ))
+            
+            # =========================================================================
+            # PHASE 2: SOFT CONSTRAINT VIOLATIONS (Only if no hard conflicts found)
+            # =========================================================================
+            if not suggestions:
+                logger.info("No hard conflicts found; analyzing soft constraints")
+                
+                teacher_subject_totals = defaultdict(lambda: defaultdict(int))
+                subject_grade_totals = defaultdict(lambda: defaultdict(int))
+                
+                total_required = 0
+                total_available = len(self.class_groups) * self.num_days * self.num_slots
+                
+                for cg in self.class_groups:
+                    grade = cg['grade']
+                    for subject in self.subjects:
+                        req = self._get_required_lessons(grade, subject)
+                        total_required += req
+                        subject_grade_totals[subject][grade] = req
+                        
+                        for teacher, t_data in self.teachers.items():
+                            for assign in t_data.get('assignments', []):
+                                if assign.get('grade') == grade and assign.get('subject') == subject:
+                                    teacher_subject_totals[teacher][subject] += assign.get('lessons', 0)
+                
+                # Capacity overload
+                if total_required > total_available:
+                    shortage = total_required - total_available
+                    subject_totals = {s: sum(subject_grade_totals[s].values()) for s in self.subjects}
+                    high_volume = sorted(subject_totals.items(), key=lambda x: x[1], reverse=True)[:3]
+                    subject_names = [s[0] for s in high_volume]
+                    
+                    suggestions.append(Suggestion(
+                        type="capacity_overload",
+                        message=f"Total required lessons ({total_required}) exceed available slots ({total_available}) by {shortage}.",
+                        fixes=[
+                            f"PRIMARY: Reduce lessons by {shortage} (suggested: {', '.join(subject_names)})",
+                            f"Remove a stream to free {self.num_days * self.num_slots} slots",
+                            f"LAST RESORT: Add an extra working day to gain {len(self.class_groups) * self.num_slots} slots"
+                        ]
+                    ))
+                
+                # Teacher overload
+                for teacher, t_data in self.teachers.items():
+                    teacher_req = sum(teacher_subject_totals[teacher].values())
+                    max_weekly = t_data.get('maxLessons')
+                    if max_weekly and teacher_req > max_weekly:
+                        overload = teacher_req - max_weekly
+                        
+                        # Find other teachers who teach same subjects and have capacity
+                        teacher_subjects = set(teacher_subject_totals[teacher].keys())
+                        available_teachers = []
+                        for other, other_data in self.teachers.items():
+                            if other == teacher:
+                                continue
+                            other_subjects = set()
+                            for assign in other_data.get('assignments', []):
+                                other_subjects.add(assign.get('subject'))
+                            if not teacher_subjects.intersection(other_subjects):
+                                continue
+                            other_req = sum(teacher_subject_totals[other].values())
+                            other_max = other_data.get('maxLessons')
+                            if other_max and other_req < other_max:
+                                available_teachers.append(other)
+                        
+                        fixes = [
+                            f"PRIMARY: Reduce {teacher}'s lessons by {overload} (from {teacher_req} to {max_weekly})"
+                        ]
+                        if available_teachers:
+                            fixes.append(f"Reassign {overload} lessons to {available_teachers[0]} (teaches same subjects, has capacity)")
+                        fixes.append(f"LAST RESORT: Increase {teacher}'s weekly maximum to {teacher_req}")
+                        
+                        suggestions.append(Suggestion(
+                            type="teacher_overload",
+                            message=f"{teacher} is assigned {teacher_req} lessons but max is {max_weekly}.",
+                            fixes=fixes,
+                            metadata={"teacher": teacher}
+                        ))
+                
+                # Daily limit
+                for teacher, t_data in self.teachers.items():
+                    teacher_req = sum(teacher_subject_totals[teacher].values())
+                    max_per_day = t_data.get('maxPerDay', self.global_max_per_day)
+                    avail_days = len(teacher_availability.get(teacher, []))
+                    if avail_days > 0 and teacher_req / avail_days > max_per_day:
+                        daily_needed = teacher_req / avail_days
+                        reduction_needed = teacher_req - (max_per_day * avail_days)
+                        
+                        fixes = [
+                            f"PRIMARY: Increase {teacher}'s daily max from {max_per_day} to {int(daily_needed) + 1}"
+                        ]
+                        if reduction_needed > 0:
+                            fixes.append(f"Reduce {teacher}'s total lessons by {reduction_needed} (from {teacher_req} to {max_per_day * avail_days})")
+                        fixes.append(f"LAST RESORT: Reduce {teacher}'s unavailable days")
+                        
+                        suggestions.append(Suggestion(
+                            type="daily_limit",
+                            message=f"{teacher} needs {daily_needed:.1f} lessons/day but max is {max_per_day}.",
+                            fixes=fixes,
+                            metadata={"teacher": teacher}
+                        ))
+            
+            # If still no suggestions, provide a diagnostic fallback
+            if not suggestions:
+                logger.warning("No specific issue identified; likely a complex constraint interaction")
+                suggestions.append(Suggestion(
+                    type="complex_conflict",
+                    message="The solver could not find a solution due to a combination of constraints.",
+                    fixes=[
+                        "Try reducing the number of lessons gradually to isolate the conflict",
+                        "Check for back-to-back subject restrictions combined with limited slots",
+                        "Verify stream-specific assignments match exactly",
+                        "Consider increasing the solver time limit"
+                    ]
+                ))
             
             logger.info(f"Analysis complete: {len(suggestions)} independent solutions generated")
+            return suggestions
             
         except Exception as e:
-            logger.error(f"Error analyzing infeasibility: {str(e)}", exc_info=True)
-        
-        return suggestions
+            logger.error(f"Error in infeasibility analysis: {str(e)}", exc_info=True)
+            return [Suggestion(
+                type="analysis_error",
+                message=f"Error during analysis: {str(e)}",
+                fixes=["Check server logs for details", "Verify configuration format"]
+            )]
 
     def solve(self) -> Optional[Dict[str, Any]]:
         try:
@@ -1019,8 +893,7 @@ def generate():
                 "success": False,
                 "message": "Request body must contain valid JSON configuration",
                 "suggestions": []
-            }), 400
-        
+            }), 400        
         logger.info(f"Received timetable generation request")
         
         solver = TimetableSolver(config)
