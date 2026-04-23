@@ -1,4 +1,9 @@
+# 1. Replace app.py with Version 5.0.0 (from previous message)
+# 2. Replace requirements.txt with:
+
 Flask==2.3.3
 flask-cors==4.0.0
 ortools==9.15.6755
 gunicorn==21.2.0
+
+# 3. Keep everything else the same
