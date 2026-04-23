@@ -1,7 +1,7 @@
 """
 EduSchedule Pro Backend
 Advanced Timetable Generator with OR-Tools CP-SAT Solver
-Production-ready with intelligent, specific, and actionable suggestions
+Production-ready with deep diagnostic logging
 """
 
 import json
@@ -39,7 +39,6 @@ CORS(app)
 # ============================================================================
 
 class ConstraintSeverity(Enum):
-    """Severity levels for constraint violations"""
     HIGH = "High"
     MEDIUM = "Medium"
     LOW = "Low"
@@ -47,7 +46,6 @@ class ConstraintSeverity(Enum):
 
 @dataclass
 class Violation:
-    """Constraint violation representation"""
     description: str
     severity: ConstraintSeverity
     value: int
@@ -62,7 +60,6 @@ class Violation:
 
 @dataclass
 class Suggestion:
-    """Infeasibility suggestion representation - ANY ONE can solve the problem"""
     type: str
     message: str
     fixes: List[str]
@@ -84,8 +81,6 @@ class Suggestion:
 # ============================================================================
 
 class ConfigValidator:
-    """Validates input configuration"""
-    
     @staticmethod
     def validate(config: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         if not isinstance(config, dict):
@@ -136,8 +131,6 @@ class ConfigValidator:
 # ============================================================================
 
 class TimetableSolver:
-    """Advanced timetable solver using OR-Tools CP-SAT"""
-    
     def __init__(self, config: Dict[str, Any]):
         try:
             is_valid, error_msg = ConfigValidator.validate(config)
@@ -263,6 +256,9 @@ class TimetableSolver:
     def _create_variables(self) -> None:
         try:
             var_count = 0
+            # 🔍 DIAGNOSTIC: Track variables created per class-subject
+            diagnostic_counts = defaultdict(lambda: defaultdict(int))
+            
             for cg in self.class_groups:
                 ck = cg['key']
                 grade = cg['grade']
@@ -304,10 +300,26 @@ class TimetableSolver:
                                     self.x[ck][d_idx][slot_idx][teacher][subject] = \
                                         self.model.NewBoolVar(var_name)
                                     var_count += 1
+                                    diagnostic_counts[ck][subject] += 1
                                 except (ValueError, TypeError) as e:
                                     logger.warning(f"Error creating variable: {str(e)}")
             
             logger.info(f"Created {var_count} decision variables")
+            
+            # 🔍 DIAGNOSTIC: Log potential problem areas
+            for cg in self.class_groups:
+                ck = cg['key']
+                grade = cg['grade']
+                for subject in self.subjects:
+                    required = self._get_required_lessons(grade, subject)
+                    created = diagnostic_counts[ck][subject]
+                    if required > 0 and created == 0:
+                        logger.error(f"🔴 CRITICAL: Grade {grade} {cg['stream_name']} needs {required} lessons of {subject}, "
+                                    f"but ZERO variables were created! Check teacher assignments, blacklists, and stream matching.")
+                    elif required > 0 and created < required:
+                        logger.warning(f"🟡 WARNING: Grade {grade} {cg['stream_name']} needs {required} lessons of {subject}, "
+                                      f"but only {created} variables created (may be insufficient).")
+            
         except Exception as e:
             logger.error(f"Error creating variables: {str(e)}", exc_info=True)
             raise
@@ -369,6 +381,10 @@ class TimetableSolver:
                             (shortage, 100000, 
                              f"Grade {grade} {cg['stream_name']}: Missing {subject} lessons")
                         )
+                    else:
+                        # 🔍 DIAGNOSTIC: No variables for a required subject
+                        logger.error(f"🔴 Grade {grade} {cg['stream_name']} needs {required} lessons of {subject}, "
+                                    f"but NO variables exist! This will cause infeasibility.")
             
             for teacher, t_data in self.teachers.items():
                 max_per_day = t_data.get('maxPerDay', self.global_max_per_day)
@@ -460,26 +476,20 @@ class TimetableSolver:
             raise
 
     def _analyze_infeasibility(self) -> List[Suggestion]:
-        """
-        Exhaustive analysis of why the timetable is infeasible.
-        Checks hard constraints first, then soft constraints.
-        Each suggestion is a complete, independent solution.
-        """
         suggestions: List[Suggestion] = []
         
         try:
             logger.info(f"Starting infeasibility analysis: {len(self.class_groups)} classes, "
                        f"{len(self.teachers)} teachers, {len(self.subjects)} subjects")
             
-            # Pre-compute teacher availability
             teacher_availability = {}
             for teacher, t_data in self.teachers.items():
                 unavail = set(t_data.get('unavailDays', []))
                 teacher_availability[teacher] = [d for d in self.working_days if d not in unavail]
             
-            # =========================================================================
-            # PHASE 1: HARD CONSTRAINT CONFLICTS (These make the problem impossible)
-            # =========================================================================
+            # 🔍 DIAGNOSTIC: Log teacher availability
+            for teacher, avail in teacher_availability.items():
+                logger.info(f"Teacher {teacher}: available on {len(avail)} days: {avail}")
             
             for cg in self.class_groups:
                 grade = cg['grade']
@@ -491,24 +501,19 @@ class TimetableSolver:
                     if required == 0:
                         continue
                     
-                    # Find eligible teachers for this grade/stream/subject
                     eligible_teachers = []
                     teacher_available_slots = {}
                     
                     for teacher, t_data in self.teachers.items():
-                        # Check blacklist
                         if f"{teacher}|{grade}" in self.blacklist:
                             continue
-                        # Check subject blacklist
                         if f"{subject}|{grade}" in self.subject_blacklist:
                             continue
                         
-                        # Check if teacher is assigned to this subject for this grade/stream
                         teaches_this = False
                         for assign in t_data.get('assignments', []):
                             if (assign.get('grade') == grade and 
                                 assign.get('subject') == subject):
-                                # Stream check
                                 assign_stream = assign.get('streamIndex')
                                 if assign_stream is not None and assign_stream != stream_idx:
                                     continue
@@ -522,7 +527,6 @@ class TimetableSolver:
                         avail_days = teacher_availability.get(teacher, [])
                         teacher_available_slots[teacher] = len(avail_days) * self.num_slots
                     
-                    # Conflict 1: No eligible teacher at all
                     if not eligible_teachers:
                         suggestions.append(Suggestion(
                             type="hard_no_teacher",
@@ -537,7 +541,6 @@ class TimetableSolver:
                         ))
                         continue
                     
-                    # Conflict 2: Total available slots from all eligible teachers < required
                     total_available = sum(teacher_available_slots.values())
                     if total_available < required:
                         suggestions.append(Suggestion(
@@ -551,22 +554,7 @@ class TimetableSolver:
                             ],
                             metadata={"grade": grade, "subject": subject, "available": total_available, "required": required}
                         ))
-                    
-                    # Conflict 3: Daily slot capacity per subject per class
-                    max_slots_per_day = self.num_slots
-                    if required > self.num_days * max_slots_per_day:
-                        suggestions.append(Suggestion(
-                            type="hard_daily_capacity",
-                            message=f"Grade {grade} {stream_name} needs {required} lessons of {subject}, "
-                                    f"but maximum possible per week is {self.num_days * max_slots_per_day}.",
-                            fixes=[
-                                f"PRIMARY: Reduce {subject} lessons to at most {self.num_days * max_slots_per_day}",
-                                f"LAST RESORT: Add more lesson slots per day or extra working day"
-                            ],
-                            metadata={"grade": grade, "subject": subject}
-                        ))
             
-            # Conflict 4: Teacher completely unavailable but assigned lessons
             for teacher, t_data in self.teachers.items():
                 avail_days = teacher_availability.get(teacher, [])
                 if not avail_days:
@@ -589,7 +577,6 @@ class TimetableSolver:
                             metadata={"teacher": teacher, "lessons": total_assigned}
                         ))
             
-            # Conflict 5: Common session reduces available slots below requirement
             if self.common_session.get('enabled'):
                 session_day = self.common_session.get('day', 'FRI')
                 session_slot = int(self.common_session.get('slotIndex', 0))
@@ -612,7 +599,6 @@ class TimetableSolver:
                                     metadata={"grade": grade, "subject": subject}
                                 ))
             
-            # Conflict 6: Blacklist contradictions (teacher assigned but blacklisted)
             for teacher, t_data in self.teachers.items():
                 for grade in self.grades:
                     if f"{teacher}|{grade}" in self.blacklist:
@@ -633,9 +619,6 @@ class TimetableSolver:
                                 metadata={"teacher": teacher, "grade": grade}
                             ))
             
-            # =========================================================================
-            # PHASE 2: SOFT CONSTRAINT VIOLATIONS (Only if no hard conflicts found)
-            # =========================================================================
             if not suggestions:
                 logger.info("No hard conflicts found; analyzing soft constraints")
                 
@@ -657,7 +640,6 @@ class TimetableSolver:
                                 if assign.get('grade') == grade and assign.get('subject') == subject:
                                     teacher_subject_totals[teacher][subject] += assign.get('lessons', 0)
                 
-                # Capacity overload
                 if total_required > total_available:
                     shortage = total_required - total_available
                     subject_totals = {s: sum(subject_grade_totals[s].values()) for s in self.subjects}
@@ -674,14 +656,12 @@ class TimetableSolver:
                         ]
                     ))
                 
-                # Teacher overload
                 for teacher, t_data in self.teachers.items():
                     teacher_req = sum(teacher_subject_totals[teacher].values())
                     max_weekly = t_data.get('maxLessons')
                     if max_weekly and teacher_req > max_weekly:
                         overload = teacher_req - max_weekly
                         
-                        # Find other teachers who teach same subjects and have capacity
                         teacher_subjects = set(teacher_subject_totals[teacher].keys())
                         available_teachers = []
                         for other, other_data in self.teachers.items():
@@ -711,7 +691,6 @@ class TimetableSolver:
                             metadata={"teacher": teacher}
                         ))
                 
-                # Daily limit
                 for teacher, t_data in self.teachers.items():
                     teacher_req = sum(teacher_subject_totals[teacher].values())
                     max_per_day = t_data.get('maxPerDay', self.global_max_per_day)
@@ -734,7 +713,6 @@ class TimetableSolver:
                             metadata={"teacher": teacher}
                         ))
             
-            # If still no suggestions, provide a diagnostic fallback
             if not suggestions:
                 logger.warning("No specific issue identified; likely a complex constraint interaction")
                 suggestions.append(Suggestion(
@@ -893,8 +871,13 @@ def generate():
                 "success": False,
                 "message": "Request body must contain valid JSON configuration",
                 "suggestions": []
-            }), 400        
-        logger.info(f"Received timetable generation request")
+            }), 400
+        
+        # 🔍 DIAGNOSTIC: Log incoming configuration summary
+        logger.info(f"Received generation request: {len(config.get('grades', []))} grades, "
+                   f"{len(config.get('subjects', []))} subjects, "
+                   f"{len(config.get('teachers', {}))} teachers, "
+                   f"{len(config.get('timeSlots', []))} time slots")
         
         solver = TimetableSolver(config)
         solution = solver.solve()
@@ -939,7 +922,7 @@ def health():
             "status": "ok",
             "timestamp": time.time(),
             "service": "EduSchedule Pro Backend",
-            "version": "3.0.0"
+            "version": "3.1.0"
         })
     except Exception as e:
         logger.error(f"Error in /health: {str(e)}", exc_info=True)
@@ -967,5 +950,5 @@ def server_error(error):
 
 
 if __name__ == '__main__':
-    logger.info("Starting EduSchedule Pro Backend v3.0.0")
+    logger.info("Starting EduSchedule Pro Backend v3.1.0")
     app.run(debug=False, host='0.0.0.0', port=5000)
