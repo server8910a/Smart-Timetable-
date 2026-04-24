@@ -1,27 +1,12 @@
 """
-EduSchedule Pro Backend — Version 6.3.0
+EduSchedule Pro Backend — Version 6.3.1 (BUGFIX)
 Advanced Timetable Generator: Ultra‑Specific Suggestions
-+ PORTFOLIO Fix + SSE Callback Fix
-
-New in v6.3:
-  • Daily availability bottleneck detection
-  • Subject schedule crowding warnings
-  • Stream merging suggestions
-  • Teacher assignment trimming proposals
-  • Blacklist conflict identification
-  • All previous categories enhanced with exact names/numbers
++ Set‑subscription fix + PORTFOLIO removed + SSE callback corrected
 """
 
 from __future__ import annotations
 
-import json
-import sys
-import time
-import uuid
-import signal
-import logging
-import hashlib
-import threading
+import json, sys, time, uuid, signal, logging, hashlib, threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -360,7 +345,7 @@ class SolutionExtractor:
                 vs.append(Violation(desc,sev,v,v*w,cov).to_dict())
         return vs
 
-# ── SUPER‑POWERED INFEASIBILITY ANALYSER ────────────────────────────
+# ── SUPER‑POWERED INFEASIBILITY ANALYSER (BUGFIX) ────────────────────
 class InfeasibilityAnalyser:
     def __init__(self, builder: ModelBuilder): self.b = builder
 
@@ -482,7 +467,8 @@ class InfeasibilityAnalyser:
                                 if t2 == teacher: continue
                                 if d in avail and any(a.get("grade")==cg_ref["grade"] and a.get("subject") in b.x[ck][d][s].get(teacher,{}) for a in t_assign.get(t2,[])):
                                     alt_teachers.append(t2)
-                        alt_str = ", ".join(set(alt_teachers)[:3]) or "none"
+                        # ✅ FIX: convert set to list before slicing
+                        alt_str = ", ".join(list(set(alt_teachers))[:3]) or "none"
                         add(Suggestion(
                             type="sole_teacher_conflict",
                             message=f"{teacher} is the only option for {len(classes)} classes at {day_lbl} {slot_lbl}: {', '.join(class_names[:3])}",
@@ -782,7 +768,7 @@ def run_solver(config, timeout=300.0, workers=8, cid="?", progress=None):
     logger.info("Solving: %d classes, %d teachers", len(builder.class_groups), len(builder.teachers))
     if progress is not None:
         cb = SolveProgressCallback(progress)
-        status = cp.Solve(builder.model, cb)  # ✅ Fixed API
+        status = cp.Solve(builder.model, cb)
     else:
         status = cp.Solve(builder.model)
     elapsed = time.time() - t0
@@ -880,7 +866,7 @@ def stream():
 def health():
     return jsonify({
         "status":"ok","timestamp":time.time(),
-        "service":"EduSchedule Pro","version":"6.3.0",
+        "service":"EduSchedule Pro","version":"6.3.1",
         "cache":_cache.stats()
     })
 
@@ -897,6 +883,6 @@ signal.signal(signal.SIGTERM, _on_sigterm)
 
 if __name__ == "__main__":
     logger.info("="*60)
-    logger.info("EduSchedule Pro v6.3.0 — Ultra‑Specific Suggestions Edition")
+    logger.info("EduSchedule Pro v6.3.1 — SET SLICING FIXED")
     logger.info("="*60)
     app.run(debug=False, host="0.0.0.0", port=5000)
