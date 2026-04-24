@@ -6,11 +6,19 @@ New in v6.1:
   • Empty‑slot analysis now suggests exact teachers and days to adjust.
   • All previous v6.0 features retained.
   • Fixed logging for Python 3.14 compatibility.
+  • Fixed: removed PORTFOLIO (unavailable in newer OR‑Tools) and corrected Solve callback API.
 """
 
 from __future__ import annotations
 
-import json, sys, time, uuid, signal, logging, hashlib, threading
+import json
+import sys
+import time
+import uuid
+import signal
+import logging
+import hashlib
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -667,12 +675,13 @@ def run_solver(config: Dict, timeout: float=300.0, workers: int=8, cid: str="?",
     cp = cp_model.CpSolver()
     cp.parameters.max_time_in_seconds = timeout
     cp.parameters.num_search_workers  = workers
-    cp.parameters.search_branching    = cp_model.PORTFOLIO
+    # PORTFOLIO removed – default branching is efficient enough.
+
     t0 = time.time()
     logger.info("Solving: %d classes, %d teachers", len(builder.class_groups), len(builder.teachers))
     if progress is not None:
         cb = SolveProgressCallback(progress)
-        status = cp.SolveWithSolutionCallback(builder.model, cb)
+        status = cp.Solve(builder.model, cb)
     else:
         status = cp.Solve(builder.model)
     elapsed = time.time()-t0
