@@ -1,7 +1,6 @@
 """
-EduSchedule Pro Backend — Version 6.3.1 (BUGFIX)
+EduSchedule Pro Backend — Version 6.3.2 (BUGFIX: blacklist attributes)
 Advanced Timetable Generator: Ultra‑Specific Suggestions
-+ Set‑subscription fix + PORTFOLIO removed + SSE callback corrected
 """
 
 from __future__ import annotations
@@ -180,7 +179,7 @@ class SolveProgressCallback(cp_model.CpSolverSolutionCallback):
             "elapsed": round(time.time()-self._start,2)
         })
 
-# ── Model Builder (unchanged) ────────────────────────────────────────
+# ── Model Builder (NOW WITH blacklist ATTRIBUTES) ──────────────────
 class ModelBuilder:
     W_MISSING_LESSON  = 500_000
     W_SPREAD          = 20_000
@@ -202,6 +201,9 @@ class ModelBuilder:
         self.grade_stream_names = config.get("gradeStreamNames",{})
         self.common_session = config.get("commonSession",{"enabled":False})
         self.global_max_per_day = int(r.get("maxTeacherPerDay",8))
+        # ✅ ADDED missing blacklist attributes
+        self.blacklist = set(config.get("blacklist", []))
+        self.subject_blacklist = set(config.get("subjectBlacklist", []))
         self.penalise_back_to_back_subjects: Set[str] = set(r.get("noBackToBack",[]))
         self.double_lessons: Dict[str,int] = r.get("doubleLesson",{})
         self.lesson_slots = [s for s in self.time_slots if s.get("type")=="lesson"]
@@ -345,7 +347,7 @@ class SolutionExtractor:
                 vs.append(Violation(desc,sev,v,v*w,cov).to_dict())
         return vs
 
-# ── SUPER‑POWERED INFEASIBILITY ANALYSER (BUGFIX) ────────────────────
+# ── SUPER‑POWERED INFEASIBILITY ANALYSER ────────────────────────────
 class InfeasibilityAnalyser:
     def __init__(self, builder: ModelBuilder): self.b = builder
 
@@ -467,7 +469,6 @@ class InfeasibilityAnalyser:
                                 if t2 == teacher: continue
                                 if d in avail and any(a.get("grade")==cg_ref["grade"] and a.get("subject") in b.x[ck][d][s].get(teacher,{}) for a in t_assign.get(t2,[])):
                                     alt_teachers.append(t2)
-                        # ✅ FIX: convert set to list before slicing
                         alt_str = ", ".join(list(set(alt_teachers))[:3]) or "none"
                         add(Suggestion(
                             type="sole_teacher_conflict",
@@ -651,7 +652,7 @@ class InfeasibilityAnalyser:
             for cg in b.class_groups:
                 grade = cg["grade"]
                 subj_taught = {a.get("subject") for a in t_assign.get(t,[]) if int(a.get("grade",0))==grade}
-                if subj_taught and f"{t}|{grade}" in b.blacklist:
+                if subj_taught and f"{t}|{grade}" in b.blacklist:   # ✅ now works
                     add(Suggestion(
                         type="blacklist_conflict",
                         message=f"{t} is blacklisted from Grade {grade} but teaches them {', '.join(subj_taught)}.",
@@ -762,16 +763,14 @@ def run_solver(config, timeout=300.0, workers=8, cid="?", progress=None):
     cp = cp_model.CpSolver()
     cp.parameters.max_time_in_seconds = timeout
     cp.parameters.num_search_workers = workers
-    # PORTFOLIO removed – default branching is efficient
-
-    t0 = time.time()
+    t0=time.time()
     logger.info("Solving: %d classes, %d teachers", len(builder.class_groups), len(builder.teachers))
     if progress is not None:
         cb = SolveProgressCallback(progress)
         status = cp.Solve(builder.model, cb)
     else:
         status = cp.Solve(builder.model)
-    elapsed = time.time() - t0
+    elapsed = time.time()-t0
     stats = builder.stats
     stats.solve_time = elapsed
     stats.status = cp.StatusName(status)
@@ -780,7 +779,6 @@ def run_solver(config, timeout=300.0, workers=8, cid="?", progress=None):
     stats.branches = cp.NumBranches()
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         stats.objective = int(cp.ObjectiveValue())
-
     logger.info("Status=%s obj=%d %.2fs", stats.status, stats.objective, elapsed)
     inc("solves_total"); inc(f"status_{stats.status}"); inc("solve_seconds", elapsed)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -834,7 +832,6 @@ def stream():
     timeout = float(request.args.get("timeout",300))
     workers = int(request.args.get("workers",8))
     progress = []
-
     def generate_events() -> Generator[str,None,None]:
         result_holder = [None]; error_holder = [None]
         def solve_thread():
@@ -859,14 +856,13 @@ def stream():
         else:
             payload = {"success":False,"suggestions":[s.to_dict() for s in suggestions],"stats":stats.to_dict()}
         yield f"event: result\ndata: {json.dumps(payload)}\n\n"
-
     return Response(stream_with_context(generate_events()), mimetype="text/event-stream")
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status":"ok","timestamp":time.time(),
-        "service":"EduSchedule Pro","version":"6.3.1",
+        "service":"EduSchedule Pro","version":"6.3.2",
         "cache":_cache.stats()
     })
 
@@ -883,6 +879,6 @@ signal.signal(signal.SIGTERM, _on_sigterm)
 
 if __name__ == "__main__":
     logger.info("="*60)
-    logger.info("EduSchedule Pro v6.3.1 — SET SLICING FIXED")
+    logger.info("EduSchedule Pro v6.3.2 — BLACKLIST BUGFIX")
     logger.info("="*60)
     app.run(debug=False, host="0.0.0.0", port=5000)
