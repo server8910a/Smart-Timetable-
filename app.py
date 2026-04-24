@@ -25,7 +25,23 @@ def validate_config(c):
     required = ["grades", "subjects", "teachers", "timeSlots", "workingDays"]
     for r in required:
         if r not in c:
-            return False, f"Missing {r}", []
+            return False, f"Missing '{r}'", []
+    # Basic type checks
+    if not isinstance(c.get("grades"), list):
+        return False, "'grades' must be a list", []
+    if not isinstance(c.get("subjects"), list):
+        return False, "'subjects' must be a list", []
+    if not isinstance(c.get("teachers"), dict):
+        return False, "'teachers' must be an object", []
+    if not isinstance(c.get("timeSlots"), list):
+        return False, "'timeSlots' must be a list", []
+    # Check each timeSlot has "type" field
+    for idx, slot in enumerate(c["timeSlots"]):
+        if "type" not in slot:
+            return False, f"timeSlots[{idx}] missing 'type' (maybe you wrote 'Docrype'?)", []
+    lesson_slots = [s for s in c["timeSlots"] if s.get("type") == "lesson"]
+    if not lesson_slots:
+        return False, "No timeSlot with type='lesson' found", []
     return True, None, []
 
 # ----------------------------------------------------------------------
@@ -215,7 +231,7 @@ def auto_reduce(config):
             subject_reductions[sub] = best
 
     if not subject_reductions:
-        # no subject reduction helped – must be another bottleneck (e.g., teacher unavailable)
+        # no subject reduction helped – must be another bottleneck
         return None, None, [{"message": "No subject‑based reduction resolves infeasibility. Check teacher availability and daily max rules."}]
 
     # Apply the found reductions to the original config
@@ -284,11 +300,28 @@ def run_solver(config):
         return None, info
 
 # ----------------------------------------------------------------------
-# API Routes
+# API Routes with improved JSON error handling
 # ----------------------------------------------------------------------
 @app.route("/generate", methods=["POST"])
 def generate():
-    config = request.json
+    try:
+        # Try to parse JSON, allow silent failure
+        config = request.get_json(force=True, silent=True)
+        if config is None:
+            # Maybe raw text? Try to decode manually
+            raw = request.get_data(as_text=True)
+            if raw:
+                config = json.loads(raw)
+            else:
+                return jsonify({"success": False, "message": "Empty request body"}), 400
+    except json.JSONDecodeError as e:
+        return jsonify({
+            "success": False,
+            "message": f"Invalid JSON in your config file: {str(e)}. Check for typos like 'Docrype' instead of 'type'."
+        }), 400
+    except Exception as e:
+        return jsonify({"success": False, "message": f"Error reading JSON: {str(e)}"}), 400
+
     ok, msg, _ = validate_config(config)
     if not ok:
         return jsonify({"success": False, "message": msg})
@@ -310,6 +343,7 @@ def home():
             body { font-family: Arial; margin: 2rem; }
             pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; border-radius: 5px; }
             button { padding: 0.5rem 1rem; cursor: pointer; }
+            .error { color: red; }
         </style>
     </head>
     <body>
@@ -324,15 +358,25 @@ def home():
                 const file = document.getElementById('configFile').files[0];
                 if (!file) return;
                 const text = await file.text();
-                const config = JSON.parse(text);
+                let config;
+                try {
+                    config = JSON.parse(text);
+                } catch(e) {
+                    document.getElementById('result').innerHTML = '<span class="error">Invalid JSON in file: ' + e.message + '</span>';
+                    return;
+                }
                 document.getElementById('result').innerText = "⏳ Solving...";
-                const res = await fetch('/generate', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(config)
-                });
-                const data = await res.json();
-                document.getElementById('result').innerText = JSON.stringify(data, null, 2);
+                try {
+                    const res = await fetch('/generate', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify(config)
+                    });
+                    const data = await res.json();
+                    document.getElementById('result').innerText = JSON.stringify(data, null, 2);
+                } catch(err) {
+                    document.getElementById('result').innerHTML = '<span class="error">Network error: ' + err.message + '</span>';
+                }
             }
         </script>
     </body>
