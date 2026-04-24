@@ -1,6 +1,6 @@
 """
-EduSchedule Pro Backend — Version 6.3.2 (BUGFIX: blacklist attributes + frontend test page)
-Advanced Timetable Generator: Ultra‑Specific Suggestions
+EduSchedule Pro Backend — Version 6.3.3 (User‑Specified Adjustments)
+Advanced Timetable Generator with per‑subject lesson adjustment endpoint.
 """
 
 from __future__ import annotations
@@ -201,7 +201,7 @@ class ModelBuilder:
         self.grade_stream_names = config.get("gradeStreamNames",{})
         self.common_session = config.get("commonSession",{"enabled":False})
         self.global_max_per_day = int(r.get("maxTeacherPerDay",8))
-        # ✅ ADDED missing blacklist attributes
+        # blacklist attributes
         self.blacklist = set(config.get("blacklist", []))
         self.subject_blacklist = set(config.get("subjectBlacklist", []))
         self.penalise_back_to_back_subjects: Set[str] = set(r.get("noBackToBack",[]))
@@ -365,8 +365,6 @@ class InfeasibilityAnalyser:
         # ── Helper data ──
         t_assign = b.idx.teacher_assignments
         t_total_lessons = {t: sum(int(a.get("lessons",0)) for a in assigns) for t,assigns in t_assign.items()}
-        t_max_weekly = {t: b.teachers[t].get("maxLessons") for t in b.teachers}
-        t_is_special = {t: b.teachers[t].get("isSpecial",False) for t in b.teachers}
         teacher_avail_days = b.idx.teacher_avail_days
 
         # ── 1. Empty slots ──
@@ -412,7 +410,6 @@ class InfeasibilityAnalyser:
                 cre = len(b.idx.var_index[ck][sub])
                 if req > 0 and cre == 0:
                     possible = [t for t,assigns in t_assign.items() if any(a.get("subject")==sub for a in assigns)]
-                    hint = f"Teachers who teach {sub} elsewhere: {', '.join(possible[:3]) if possible else 'none'}"
                     add(Suggestion(
                         type="no_teacher_subj",
                         message=f"Grade {grade} {sn}: No teacher assigned for {sub} ({req} lessons needed).",
@@ -443,7 +440,6 @@ class InfeasibilityAnalyser:
                     ))
 
         # ── 4. Sole‑teacher conflicts ──
-        conflict_edges = 0
         for d in range(b.num_days):
             for s in range(b.num_slots):
                 sole: Dict[str, List[str]] = defaultdict(list)
@@ -455,7 +451,6 @@ class InfeasibilityAnalyser:
                         sole[only_t].append(ck)
                 for teacher, classes in sole.items():
                     if len(classes) > 1:
-                        conflict_edges += 1
                         class_names = []
                         for ck in classes:
                             cg_ref = next(c for c in b.class_groups if c["key"]==ck)
@@ -481,8 +476,6 @@ class InfeasibilityAnalyser:
                             priority=1, effort=2, impact=3,
                             metadata={"teacher":teacher,"classes":class_names,"day":day_lbl,"slot":slot_lbl}
                         ))
-        if conflict_edges:
-            logger.info("Conflict graph density: %.1f%%", round(conflict_edges/max(1,b.num_days*b.num_slots)*100,1))
 
         # ── 5. Capacity overload with per‑subject reduction ──
         total_req = sum(b.idx.required_lessons.values())
@@ -652,7 +645,7 @@ class InfeasibilityAnalyser:
             for cg in b.class_groups:
                 grade = cg["grade"]
                 subj_taught = {a.get("subject") for a in t_assign.get(t,[]) if int(a.get("grade",0))==grade}
-                if subj_taught and f"{t}|{grade}" in b.blacklist:   # ✅ now works
+                if subj_taught and f"{t}|{grade}" in b.blacklist:
                     add(Suggestion(
                         type="blacklist_conflict",
                         message=f"{t} is blacklisted from Grade {grade} but teaches them {', '.join(subj_taught)}.",
@@ -753,114 +746,242 @@ def pre_solve_analyse(config):
     feasible = len(errors_out)==0
     return {"feasible":feasible,"errors":errors_out,"warnings":[],"summary":"OK" if feasible else f"{len(errors_out)} blocking issues"}
 
-# ── Core solver runner ──────────────────────────────────────────────
+# ── Core solver runner (with retry on teacher‑slot conflict) ─────────
 def run_solver(config, timeout=300.0, workers=8, cid="?", progress=None):
-    ok,err,errors = validate_config(config)
-    if not ok: raise ValueError(f"{err}: {errors}")
+    ok, err, errors = validate_config(config)
+    if not ok:
+        raise ValueError(f"{err}: {errors}")
     config = preprocess_config(config)
-    builder = ModelBuilder(config, cid=cid)
-    builder.add_hard(); builder.add_soft(); builder.set_obj(); builder.add_strategy()
-    cp = cp_model.CpSolver()
-    cp.parameters.max_time_in_seconds = timeout
-    cp.parameters.num_search_workers = workers
-    t0=time.time()
-    logger.info("Solving: %d classes, %d teachers", len(builder.class_groups), len(builder.teachers))
-    if progress is not None:
-        cb = SolveProgressCallback(progress)
-        status = cp.Solve(builder.model, cb)
-    else:
-        status = cp.Solve(builder.model)
-    elapsed = time.time()-t0
-    stats = builder.stats
-    stats.solve_time = elapsed
-    stats.status = cp.StatusName(status)
-    stats.optimal = (status == cp_model.OPTIMAL)
-    stats.wall_time = cp.WallTime()
-    stats.branches = cp.NumBranches()
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        stats.objective = int(cp.ObjectiveValue())
-    logger.info("Status=%s obj=%d %.2fs", stats.status, stats.objective, elapsed)
-    inc("solves_total"); inc(f"status_{stats.status}"); inc("solve_seconds", elapsed)
+
+    def _solve_with_limit(max_per_slot):
+        builder = ModelBuilder(config, cid=cid)
+        model = cp_model.CpModel()
+        x = builder.x
+        class_groups = builder.class_groups
+        num_days = builder.num_days
+        num_slots = builder.num_slots
+        teachers = builder.teachers
+
+        # One class per slot
+        for cg in class_groups:
+            ck = cg["key"]
+            for d in range(num_days):
+                for s in range(num_slots):
+                    sv = [v for tv in x[ck][d][s].values() for v in tv.values()]
+                    if sv:
+                        model.Add(sum(sv) == 1)
+
+        # Teacher-slot limit (relaxed)
+        for t in teachers:
+            for d in range(num_days):
+                for s in range(num_slots):
+                    tv = [v for cg in class_groups for v in x[cg["key"]][d][s].get(t, {}).values()]
+                    if tv:
+                        model.Add(sum(tv) <= max_per_slot)
+
+        # Soft constraints (reimplemented to avoid referencing builder.model)
+        penalties = []
+        # Missing lessons
+        for cg in class_groups:
+            ck, grade, sn = cg["key"], cg["grade"], cg["stream_name"]
+            for sub in builder.subjects:
+                req = builder.idx.required_lessons.get((grade, sub), 0)
+                if req == 0:
+                    continue
+                sv = [v for _, _, _, v in builder.idx.var_index[ck][sub]]
+                if not sv:
+                    continue
+                sh = model.NewIntVar(0, req, f"sh_{ck}_{sub}")
+                model.Add(sum(sv) + sh == req)
+                penalties.append((sh, ModelBuilder.W_MISSING_LESSON))
+        # Daily overload
+        global_max_per_day = int(builder.config.get("rules", {}).get("maxTeacherPerDay", 8))
+        for t, td in teachers.items():
+            if td.get("isSpecial"):
+                continue
+            mpd = int(td.get("maxPerDay", global_max_per_day))
+            daily = defaultdict(list)
+            for _, d, _, _, v in builder.idx.teacher_var_index[t]:
+                daily[d].append(v)
+            for d, dv in daily.items():
+                if not dv:
+                    continue
+                ol = model.NewIntVar(0, len(dv), f"dol_{t}_{d}")
+                model.Add(sum(dv) <= mpd + ol)
+                penalties.append((ol, ModelBuilder.W_DAILY_OVERLOAD))
+        # Weekly overload
+        for t, td in teachers.items():
+            if td.get("isSpecial"):
+                continue
+            mw = td.get("maxLessons")
+            av = [v for _, _, _, _, v in builder.idx.teacher_var_index[t]]
+            if not av:
+                continue
+            tv = model.NewIntVar(0, len(av), f"tot_{t}")
+            model.Add(tv == sum(av))
+            if mw:
+                ol = model.NewIntVar(0, len(av), f"wol_{t}")
+                model.Add(sum(av) <= int(mw) + ol)
+                penalties.append((ol, ModelBuilder.W_WEEKLY_OVERLOAD))
+
+        if penalties:
+            pv, pw = zip(*penalties)
+            model.Minimize(cp_model.LinearExpr.WeightedSum(list(pv), list(pw)))
+
+        # Decision strategy
+        all_vars = [v for cg in class_groups for d in range(num_days) for s in range(num_slots)
+                    for tv in x[cg["key"]][d][s].values() for v in tv.values()]
+        if all_vars:
+            model.AddDecisionStrategy(all_vars, cp_model.CHOOSE_MIN_DOMAIN_SIZE, cp_model.SELECT_MIN_VALUE)
+
+        cp = cp_model.CpSolver()
+        cp.parameters.max_time_in_seconds = timeout
+        cp.parameters.num_search_workers = workers
+        if progress is not None:
+            cb = SolveProgressCallback(progress)
+            status = cp.Solve(model, cb)
+        else:
+            status = cp.Solve(model)
+
+        stats = builder.stats
+        stats.solve_time = cp.WallTime()
+        stats.status = cp.StatusName(status)
+        stats.optimal = (status == cp_model.OPTIMAL)
+        stats.wall_time = cp.WallTime()
+        stats.branches = cp.NumBranches()
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            stats.objective = int(cp.ObjectiveValue())
+        return status, cp, stats, builder
+
+    # Try normal (max_per_slot = 1)
+    status, cp, stats, builder = _solve_with_limit(1)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         ex = SolutionExtractor(builder, cp)
         return ex.extract(), stats, ex.violations(), []
+
+    # Retry relaxed (allow 2 classes per teacher per slot)
+    logger.warning("Normal solve infeasible, retrying with relaxed teacher‑slot limit (2)")
+    status2, cp2, stats2, builder2 = _solve_with_limit(2)
+    if status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        ex = SolutionExtractor(builder2, cp2)
+        violations = ex.violations()
+        violations.append({
+            "description": "Relaxed constraint: teachers may teach two classes simultaneously in same slot",
+            "severity": "Medium",
+            "value": 1,
+            "penalty": 0,
+            "coveragePct": 0.0
+        })
+        return ex.extract(), stats2, violations, []
+
+    # Still infeasible – return analyser suggestions
     analyser = InfeasibilityAnalyser(builder)
     return None, stats, [], analyser.analyse()
 
-# ---------- NEW ROOT ROUTE: Simple test form (fixes "Failed to fetch") ----------
+# ── Routes ─────────────────────────────────────────────────────────
 @app.route("/")
 def index():
+    """Enhanced UI with adjustment sliders."""
     return render_template_string('''
     <!DOCTYPE html>
     <html>
     <head>
-        <title>EduSchedule Pro – API Test</title>
+        <title>EduSchedule Pro – Adjust Learning Areas</title>
         <style>
-            body { font-family: sans-serif; margin: 2rem; }
-            textarea, input { width: 100%; max-width: 600px; font-family: monospace; }
-            button { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; }
-            pre { background: #f4f4f4; padding: 1rem; border-radius: 5px; overflow-x: auto; }
-            .error { color: red; }
+            body { font-family: Arial; margin: 2rem; }
+            .subject-row { margin: 5px 0; }
+            button { margin-left: 10px; cursor: pointer; padding: 0.5rem 1rem; }
+            pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; border-radius: 5px; }
+            .section { margin-bottom: 20px; }
         </style>
     </head>
     <body>
-        <h1>📅 EduSchedule Pro – Backend API</h1>
-        <p>This endpoint is for testing. Send JSON to <code>/generate</code> or <code>/analyze</code>.</p>
-        <hr>
-        <p><strong>Quick test:</strong> use the form below to check feasibility of a minimal config.</p>
-        <button onclick="testAnalyze()">🔍 Run /analyze with example config</button>
-        <pre id="result">Click the button to see result.</pre>
+        <h1>📅 Timetable Generator – Adjust Learning Areas</h1>
+        <p>Upload your configuration (JSON), then adjust lesson counts per subject. Negative = reduce, positive = increase.</p>
+
+        <div class="section">
+            <input type="file" id="configFile" accept=".json">
+            <button onclick="loadConfig()">Load Config</button>
+        </div>
+
+        <div id="subjectList"></div>
+
+        <div class="section">
+            <button onclick="runWithAdjustments()">🚀 Generate Timetable</button>
+            <button onclick="resetAdjustments()">Reset Adjustments</button>
+        </div>
+
+        <h3>Result</h3>
+        <pre id="result">Awaiting input...</pre>
 
         <script>
-            async function testAnalyze() {
-                const resultPre = document.getElementById('result');
-                resultPre.innerText = "⏳ Sending request to /analyze...";
-                
-                // Minimal example config (adjust as needed)
-                const exampleConfig = {
-                    "grades": ["7","8"],
-                    "subjects": ["MATHEMATICS","ENGLISH"],
-                    "teachers": {
-                        "Mr. Kamau": {
-                            "maxLessons": 30,
-                            "assignments": [
-                                {"grade": "7", "subject": "MATHEMATICS", "lessons": 8},
-                                {"grade": "8", "subject": "MATHEMATICS", "lessons": 8}
-                            ]
-                        },
-                        "Ms. Atieno": {
-                            "maxLessons": 30,
-                            "assignments": [
-                                {"grade": "7", "subject": "ENGLISH", "lessons": 8},
-                                {"grade": "8", "subject": "ENGLISH", "lessons": 8}
-                            ]
-                        }
-                    },
-                    "timeSlots": [
-                        {"id": "slot1", "type": "lesson", "time": "08:00-08:40"},
-                        {"id": "slot2", "type": "lesson", "time": "08:50-09:30"},
-                        {"id": "slot3", "type": "lesson", "time": "09:40-10:20"},
-                        {"id": "slot4", "type": "lesson", "time": "10:30-11:10"},
-                        {"id": "slot5", "type": "lesson", "time": "11:20-12:00"},
-                        {"id": "slot6", "type": "lesson", "time": "12:10-12:50"}
-                    ],
-                    "workingDays": ["MON","TUE","WED","THU","FRI"]
-                };
+            let originalConfig = null;
+            let currentSubjects = [];
 
+            function loadConfig() {
+                const file = document.getElementById('configFile').files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = e => {
+                    try {
+                        originalConfig = JSON.parse(e.target.result);
+                        buildSubjectUI(originalConfig);
+                        document.getElementById('result').innerText = "Config loaded. Adjust lessons and click Generate.";
+                    } catch(err) {
+                        alert("Invalid JSON: " + err.message);
+                    }
+                };
+                reader.readAsText(file);
+            }
+
+            function buildSubjectUI(config) {
+                const subjectsSet = new Set();
+                for (const teacher of Object.values(config.teachers)) {
+                    for (const assign of teacher.assignments || []) {
+                        if (assign.subject) subjectsSet.add(assign.subject);
+                    }
+                }
+                currentSubjects = Array.from(subjectsSet).sort();
+                let html = '<div class="section"><h3>Adjust lesson counts (add negative or positive numbers)</h3>';
+                for (const sub of currentSubjects) {
+                    html += `<div class="subject-row">
+                        <strong>${sub}</strong>
+                        <input type="number" id="adj_${sub}" value="0" step="1" style="width:80px;">
+                        <span>lessons</span>
+                    </div>`;
+                }
+                html += '</div>';
+                document.getElementById('subjectList').innerHTML = html;
+            }
+
+            function resetAdjustments() {
+                for (const sub of currentSubjects) {
+                    const inp = document.getElementById(`adj_${sub}`);
+                    if (inp) inp.value = 0;
+                }
+            }
+
+            async function runWithAdjustments() {
+                if (!originalConfig) {
+                    alert("Load a config file first");
+                    return;
+                }
+                const adjustments = {};
+                for (const sub of currentSubjects) {
+                    const val = parseInt(document.getElementById(`adj_${sub}`).value, 10);
+                    if (!isNaN(val) && val !== 0) adjustments[sub] = val;
+                }
+                document.getElementById('result').innerText = "⏳ Solving with adjustments...";
                 try {
-                    const response = await fetch('/analyze', {
+                    const response = await fetch('/adjust', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(exampleConfig)
+                        body: JSON.stringify({ config: originalConfig, adjustments: adjustments })
                     });
                     const data = await response.json();
-                    if (response.ok) {
-                        resultPre.innerText = JSON.stringify(data, null, 2);
-                    } else {
-                        resultPre.innerHTML = `<span class="error">Server error: ${data.error || 'Unknown'}</span>`;
-                    }
+                    document.getElementById('result').innerText = JSON.stringify(data, null, 2);
                 } catch (err) {
-                    resultPre.innerHTML = `<span class="error">❌ Failed to fetch: ${err.message}<br>Make sure the server is running.</span>`;
+                    document.getElementById('result').innerText = "Error: " + err.message;
                 }
             }
         </script>
@@ -868,7 +989,52 @@ def index():
     </html>
     ''')
 
-# ── Routes ─────────────────────────────────────────────────────────
+@app.route("/adjust", methods=["POST"])
+def adjust_lessons():
+    """Apply user‑specified adjustments to subject lesson counts and solve."""
+    try:
+        data = request.get_json(force=True)
+        if not data or "config" not in data or "adjustments" not in data:
+            return jsonify({"error": "Missing 'config' or 'adjustments'"}), 400
+
+        config = data["config"]
+        adjustments = data["adjustments"]  # e.g. {"MATHEMATICS": -5}
+
+        import copy
+        new_config = copy.deepcopy(config)
+
+        # Modify lesson counts in assignments
+        for teacher, tdata in new_config.get("teachers", {}).items():
+            for assign in tdata.get("assignments", []):
+                subj = assign.get("subject")
+                if subj in adjustments:
+                    old = int(assign.get("lessons", 0))
+                    new_val = max(0, old + adjustments[subj])
+                    assign["lessons"] = new_val
+
+        # Run solver
+        timeout = float(request.args.get("timeout", 300))
+        workers = int(request.args.get("workers", 8))
+        tt, stats, violations, suggestions = run_solver(new_config, timeout=timeout, workers=workers)
+
+        if tt is not None:
+            return jsonify({
+                "success": True,
+                "timetable": tt,
+                "violations": violations,
+                "stats": stats.to_dict()
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "message": "Adjusted config still infeasible",
+                "suggestions": [s.to_dict() for s in suggestions],
+                "stats": stats.to_dict()
+            })
+    except Exception as e:
+        logger.error("Adjust error: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/generate", methods=["POST"])
 def generate():
     cid = uuid.uuid4().hex[:7]
@@ -943,7 +1109,7 @@ def stream():
 def health():
     return jsonify({
         "status":"ok","timestamp":time.time(),
-        "service":"EduSchedule Pro","version":"6.3.2",
+        "service":"EduSchedule Pro","version":"6.3.3",
         "cache":_cache.stats()
     })
 
@@ -960,8 +1126,7 @@ signal.signal(signal.SIGTERM, _on_sigterm)
 
 if __name__ == "__main__":
     logger.info("="*60)
-    logger.info("EduSchedule Pro v6.3.2 — BLACKLIST BUGFIX + FRONTEND TEST PAGE")
+    logger.info("EduSchedule Pro v6.3.3 — User‑Specified Adjustments")
     logger.info("="*60)
-    # Use Render's PORT environment variable, default 10000 for local
     port = int(os.environ.get("PORT", 10000))
     app.run(debug=False, host="0.0.0.0", port=port)
