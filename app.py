@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json, time, uuid, logging, threading, os
+import json, os, logging
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Set, Optional
+from typing import Dict, List, Tuple
 
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
@@ -19,33 +19,25 @@ app = Flask(__name__)
 CORS(app)
 
 # ----------------------------------------------------------------------
-# Validation
+# Validation (with helpful error for missing 'type')
 # ----------------------------------------------------------------------
 def validate_config(c):
     required = ["grades", "subjects", "teachers", "timeSlots", "workingDays"]
     for r in required:
         if r not in c:
-            return False, f"Missing '{r}'", []
-    # Basic type checks
-    if not isinstance(c.get("grades"), list):
-        return False, "'grades' must be a list", []
-    if not isinstance(c.get("subjects"), list):
-        return False, "'subjects' must be a list", []
-    if not isinstance(c.get("teachers"), dict):
-        return False, "'teachers' must be an object", []
+            return False, f"Missing '{r}'"
     if not isinstance(c.get("timeSlots"), list):
-        return False, "'timeSlots' must be a list", []
-    # Check each timeSlot has "type" field
+        return False, "'timeSlots' must be a list"
     for idx, slot in enumerate(c["timeSlots"]):
         if "type" not in slot:
-            return False, f"timeSlots[{idx}] missing 'type' (maybe you wrote 'Docrype'?)", []
+            return False, f"timeSlots[{idx}] missing 'type' (did you write 'Docrype'?)"
     lesson_slots = [s for s in c["timeSlots"] if s.get("type") == "lesson"]
     if not lesson_slots:
-        return False, "No timeSlot with type='lesson' found", []
-    return True, None, []
+        return False, "No timeSlot with type='lesson' found"
+    return True, None
 
 # ----------------------------------------------------------------------
-# Data Index (required lessons per grade/subject, teacher availability)
+# Data Index
 # ----------------------------------------------------------------------
 @dataclass
 class ScheduleIndex:
@@ -69,12 +61,12 @@ class ScheduleIndex:
                 total = 0
                 for t in teachers:
                     for a in self.teacher_assignments[t]:
-                        if a["grade"] == g and a["subject"] == s:
-                            total += a["lessons"]
+                        if a.get("grade") == g and a.get("subject") == s:
+                            total += a.get("lessons", 0)
                 self.required_lessons[(g, s)] = total
 
 # ----------------------------------------------------------------------
-# Model Builder (strict teacher‑slot constraint = 1)
+# Model Builder (strict teacher per slot)
 # ----------------------------------------------------------------------
 class ModelBuilder:
     def __init__(self, config):
@@ -92,7 +84,6 @@ class ModelBuilder:
 
         self.x = {}
         self.penalties = []
-
         self._create_vars()
 
     def _create_vars(self):
@@ -103,12 +94,14 @@ class ModelBuilder:
                 for s in range(len(self.slots)):
                     self.x[g][d][s] = {}
                     for t in self.teachers:
-                        if d not in self.idx.teacher_avail_days[t]:
+                        if d not in self.idx.teacher_avail_days.get(t, set()):
                             continue
-                        for a in self.idx.teacher_assignments[t]:
-                            if a["grade"] != g:
+                        for a in self.idx.teacher_assignments.get(t, []):
+                            if a.get("grade") != g:
                                 continue
-                            sub = a["subject"]
+                            sub = a.get("subject")
+                            if not sub:
+                                continue
                             v = self.model.NewBoolVar(f"x_{g}_{d}_{s}_{t}_{sub}")
                             self.x[g][d][s].setdefault(t, {})[sub] = v
                             self.idx.var_index[(g, sub)].append(v)
@@ -135,7 +128,7 @@ class ModelBuilder:
 
     def add_soft(self):
         for (g, sub), req in self.idx.required_lessons.items():
-            vars_ = self.idx.var_index[(g, sub)]
+            vars_ = self.idx.var_index.get((g, sub), [])
             if not vars_:
                 continue
             slack = self.model.NewIntVar(0, req, f"slack_{g}_{sub}")
@@ -147,7 +140,7 @@ class ModelBuilder:
             self.model.Minimize(sum(self.penalties))
 
 # ----------------------------------------------------------------------
-# Extractor (timetable from solved model)
+# Extractor
 # ----------------------------------------------------------------------
 class Extractor:
     def __init__(self, builder, solver):
@@ -171,46 +164,47 @@ class Extractor:
         return out
 
 # ----------------------------------------------------------------------
-# Auto‑reduction: binary search per subject to find minimal lesson cuts
+# Auto‑reduction (core logic)
 # ----------------------------------------------------------------------
 def auto_reduce(config):
     """
-    Returns (new_config, timetable, reduction_info) if a feasible strict schedule
-    becomes possible after minimal lesson reductions; otherwise (None, None, suggestions).
+    Returns (new_config, timetable, info) after applying minimal lesson reductions.
     """
-    builder_orig = ModelBuilder(config)
-    total_before = sum(builder_orig.idx.required_lessons.values())
+    # First, compute total lessons before
+    orig_builder = ModelBuilder(config)
+    total_before = sum(orig_builder.idx.required_lessons.values())
 
     # For each subject, binary search the minimal total reduction needed
     subject_reductions = {}
     for sub in config["subjects"]:
-        # Total lessons of this subject in original config
+        # Total lessons of this subject
         total_sub = 0
-        for (g, s), val in builder_orig.idx.required_lessons.items():
+        for (g, s), val in orig_builder.idx.required_lessons.items():
             if s == sub:
                 total_sub += val
         if total_sub == 0:
             continue
 
-        lo, hi = 0, total_sub
-        best = total_sub  # worst case: remove all of this subject
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            # Build a test config with `mid` lessons removed from this subject
+        low, high = 0, total_sub
+        best = total_sub
+        while low <= high:
+            mid = (low + high) // 2
+            # Build test config with `mid` lessons removed from this subject
             test_config = json.loads(json.dumps(config))
             remaining = mid
-            # collect all assignments for this subject, sort descending
+            # Find all assignments for this subject, sorted descending
             assigns = []
             for t, tdata in test_config["teachers"].items():
                 for a in tdata.get("assignments", []):
-                    if a["subject"] == sub:
+                    if a.get("subject") == sub:
                         assigns.append(a)
-            assigns.sort(key=lambda a: a["lessons"], reverse=True)
+            assigns.sort(key=lambda a: a.get("lessons", 0), reverse=True)
             for a in assigns:
                 if remaining <= 0:
                     break
-                cut = min(a["lessons"], remaining)
-                a["lessons"] -= cut
+                old = a.get("lessons", 0)
+                cut = min(old, remaining)
+                a["lessons"] = old - cut
                 remaining -= cut
 
             # Test feasibility with strict constraints
@@ -218,45 +212,40 @@ def auto_reduce(config):
             b_test.add_hard()
             b_test.add_soft()
             b_test.set_obj()
-            s_test = cp_model.CpSolver()
-            s_test.parameters.max_time_in_seconds = 10
-            status = s_test.Solve(b_test.model)
+            solver_test = cp_model.CpSolver()
+            solver_test.parameters.max_time_in_seconds = 10
+            status = solver_test.Solve(b_test.model)
             if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 best = mid
-                hi = mid - 1
+                high = mid - 1
             else:
-                lo = mid + 1
+                low = mid + 1
 
         if best > 0:
             subject_reductions[sub] = best
 
     if not subject_reductions:
-        # no subject reduction helped – must be another bottleneck
-        return None, None, [{"message": "No subject‑based reduction resolves infeasibility. Check teacher availability and daily max rules."}]
+        return None, None, [{"message": "No subject reduction resolves infeasibility. Check teacher availability."}]
 
-    # Apply the found reductions to the original config
+    # Apply the reductions to the original config
     final_config = json.loads(json.dumps(config))
     for sub, reduce_by in subject_reductions.items():
         remaining = reduce_by
         assigns = []
         for t, tdata in final_config["teachers"].items():
             for a in tdata.get("assignments", []):
-                if a["subject"] == sub:
+                if a.get("subject") == sub:
                     assigns.append(a)
-        assigns.sort(key=lambda a: a["lessons"], reverse=True)
+        assigns.sort(key=lambda a: a.get("lessons", 0), reverse=True)
         for a in assigns:
             if remaining <= 0:
                 break
-            cut = min(a["lessons"], remaining)
-            a["lessons"] -= cut
+            old = a.get("lessons", 0)
+            cut = min(old, remaining)
+            a["lessons"] = old - cut
             remaining -= cut
 
-    total_after = 0
-    for tdata in final_config["teachers"].values():
-        for a in tdata.get("assignments", []):
-            total_after += a["lessons"]
-
-    # Final solve with reduced config
+    # Solve with reduced config
     builder_final = ModelBuilder(final_config)
     builder_final.add_hard()
     builder_final.add_soft()
@@ -266,20 +255,20 @@ def auto_reduce(config):
     status_final = solver_final.Solve(builder_final.model)
     if status_final in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         tt = Extractor(builder_final, solver_final).extract()
+        total_after = sum(builder_final.idx.required_lessons.values())
         info = [{
-            "message": f"Auto‑reduced lessons by {total_before - total_after} total",
+            "message": f"Auto‑reduced lessons by {total_before - total_after}",
             "details": subject_reductions
         }]
         return final_config, tt, info
     else:
-        # Should not happen, but fallback
         return None, None, [{"message": "Reductions applied but still infeasible"}]
 
 # ----------------------------------------------------------------------
-# Solver entry point (strict only, auto‑reduce if needed)
+# Solver entry point
 # ----------------------------------------------------------------------
 def run_solver(config):
-    # First try original config
+    # Try original config
     builder = ModelBuilder(config)
     builder.add_hard()
     builder.add_soft()
@@ -287,7 +276,6 @@ def run_solver(config):
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 20
     status = solver.Solve(builder.model)
-
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         tt = Extractor(builder, solver).extract()
         return tt, []
@@ -300,29 +288,22 @@ def run_solver(config):
         return None, info
 
 # ----------------------------------------------------------------------
-# API Routes with improved JSON error handling
+# API routes
 # ----------------------------------------------------------------------
 @app.route("/generate", methods=["POST"])
 def generate():
     try:
-        # Try to parse JSON, allow silent failure
-        config = request.get_json(force=True, silent=True)
-        if config is None:
-            # Maybe raw text? Try to decode manually
-            raw = request.get_data(as_text=True)
-            if raw:
-                config = json.loads(raw)
-            else:
-                return jsonify({"success": False, "message": "Empty request body"}), 400
+        data = request.get_data(as_text=True)
+        if not data:
+            return jsonify({"success": False, "message": "Empty request body"}), 400
+        config = json.loads(data)
     except json.JSONDecodeError as e:
         return jsonify({
             "success": False,
-            "message": f"Invalid JSON in your config file: {str(e)}. Check for typos like 'Docrype' instead of 'type'."
+            "message": f"Invalid JSON: {str(e)}. Check for typos like 'Docrype' instead of 'type'."
         }), 400
-    except Exception as e:
-        return jsonify({"success": False, "message": f"Error reading JSON: {str(e)}"}), 400
 
-    ok, msg, _ = validate_config(config)
+    ok, msg = validate_config(config)
     if not ok:
         return jsonify({"success": False, "message": msg})
 
@@ -337,21 +318,14 @@ def home():
     return render_template_string('''
     <!DOCTYPE html>
     <html>
-    <head>
-        <title>EduSchedule Pro – Auto‑Reduction</title>
-        <style>
-            body { font-family: Arial; margin: 2rem; }
-            pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; border-radius: 5px; }
-            button { padding: 0.5rem 1rem; cursor: pointer; }
-            .error { color: red; }
-        </style>
+    <head><title>EduSchedule Pro</title>
+    <style>body{font-family:Arial;margin:2rem}pre{background:#f4f4f4;padding:1rem;border-radius:5px}button{padding:0.5rem 1rem}</style>
     </head>
     <body>
         <h1>📅 Timetable Generator (Strict Teacher‑Slot)</h1>
-        <p>Upload your configuration (JSON) – the system automatically reduces the fewest lessons if needed.</p>
+        <p>Upload your config JSON – the system automatically reduces the fewest lessons if needed.</p>
         <input type="file" id="configFile" accept=".json">
         <button onclick="generate()">Generate Timetable</button>
-        <h3>Result</h3>
         <pre id="result">Awaiting input...</pre>
         <script>
             async function generate() {
@@ -359,23 +333,17 @@ def home():
                 if (!file) return;
                 const text = await file.text();
                 let config;
-                try {
-                    config = JSON.parse(text);
-                } catch(e) {
-                    document.getElementById('result').innerHTML = '<span class="error">Invalid JSON in file: ' + e.message + '</span>';
+                try { config = JSON.parse(text); } catch(e) {
+                    document.getElementById('result').innerText = "Invalid JSON: " + e.message;
                     return;
                 }
-                document.getElementById('result').innerText = "⏳ Solving...";
+                document.getElementById('result').innerText = "Solving...";
                 try {
-                    const res = await fetch('/generate', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify(config)
-                    });
+                    const res = await fetch('/generate', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config) });
                     const data = await res.json();
                     document.getElementById('result').innerText = JSON.stringify(data, null, 2);
-                } catch(err) {
-                    document.getElementById('result').innerHTML = '<span class="error">Network error: ' + err.message + '</span>';
+                } catch(e) {
+                    document.getElementById('result').innerText = "Network error: " + e.message;
                 }
             }
         </script>
