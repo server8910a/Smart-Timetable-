@@ -1,5 +1,5 @@
 """
-EduSchedule Pro Backend - Version 5.0.0
+EduSchedule Pro Backend - Version 5.1.0
 Advanced Timetable Generator
 
 Features:
@@ -10,6 +10,7 @@ Features:
   - Prioritised, deduplicated infeasibility suggestions
   - Special teacher support (no workload limits)
   - Comprehensive diagnostic logging
+  - SPECIFIC suggestions with exact numbers and teacher names
 """
 
 import json
@@ -384,38 +385,247 @@ class InfeasibilityAnalyser:
         b = self.b
         suggestions: List[Suggestion] = []
         seen: Set[str] = set()
+
         def add(s: Suggestion) -> None:
             key = s.type + s.message
             if key not in seen:
                 seen.add(key)
                 suggestions.append(s)
+
+        # =====================================================================
+        # PHASE 1: HARD CONSTRAINT VIOLATIONS (Most Specific)
+        # =====================================================================
+
+        # 1a) Check for empty slots (no possible teacher for a specific slot)
         for cg in b.class_groups:
-            ck, grade = cg["key"], cg["grade"]
+            ck, grade, stream_name = cg["key"], cg["grade"], cg["stream_name"]
+            empty_slots = []
+            for d_idx in range(b.num_days):
+                for slot_idx in range(b.num_slots):
+                    vars_in_slot = [var for t_vars in b.x[ck][d_idx][slot_idx].values() for var in t_vars.values()]
+                    if not vars_in_slot:
+                        day_name = b.working_days[d_idx]
+                        slot_time = b.lesson_slots[slot_idx]["time"] if slot_idx < len(b.lesson_slots) else f"Slot {slot_idx+1}"
+                        empty_slots.append(f"{day_name} {slot_time}")
+
+            if empty_slots:
+                add(Suggestion(
+                    type="empty_slots",
+                    message=f"Grade {grade} {stream_name} has {len(empty_slots)} slot(s) with NO possible teacher.",
+                    fixes=[
+                        f"Empty slots: {', '.join(empty_slots[:5])}{'...' if len(empty_slots) > 5 else ''}",
+                        f"Ensure at least one teacher is available and assigned to teach Grade {grade} during these times",
+                        f"Check teacher availability settings for Grade {grade}"
+                    ],
+                    priority=1,
+                    metadata={"grade": grade, "stream": stream_name, "empty_slots": len(empty_slots)}
+                ))
+
+        # 1b) Per-subject variable shortage (not enough possible assignments)
+        for cg in b.class_groups:
+            ck, grade, stream_name = cg["key"], cg["grade"], cg["stream_name"]
             for subject in b.subjects:
                 required = b.idx.required_lessons.get((grade, subject), 0)
                 created = len(b.idx.var_index[ck][subject])
+
                 if required > 0 and created == 0:
-                    add(Suggestion(type="no_eligible_teacher", message=f"Grade {grade} {cg['stream_name']} needs {required} lessons of {subject} but no teacher is assigned.", fixes=[f"Assign a teacher to {subject} for Grade {grade}", f"Remove the {subject} lesson requirement for this class", f"Check if {subject} is subject-blacklisted for Grade {grade}"], priority=1, metadata={"grade": grade, "subject": subject}))
+                    add(Suggestion(
+                        type="no_teacher_for_subject",
+                        message=f"Grade {grade} {stream_name} needs {required} lessons of {subject} but NO teacher is assigned to teach it.",
+                        fixes=[
+                            f"Assign a teacher to teach {subject} for Grade {grade} {stream_name}",
+                            f"Remove {subject} requirement for this class",
+                            f"Check if {subject} is subject-blacklisted for Grade {grade}"
+                        ],
+                        priority=1,
+                        metadata={"grade": grade, "subject": subject, "stream": stream_name}
+                    ))
+                elif required > 0 and created < required:
+                    add(Suggestion(
+                        type="insufficient_variables",
+                        message=f"Grade {grade} {stream_name} needs {required} lessons of {subject} but only {created} assignments are possible.",
+                        fixes=[
+                            f"Increase teacher availability for {subject} (teachers are unavailable on some days)",
+                            f"Reduce required lessons for {subject} from {required} to {created}",
+                            f"Add another teacher who can teach {subject} for Grade {grade}"
+                        ],
+                        priority=1,
+                        metadata={"grade": grade, "subject": subject, "required": required, "created": created}
+                    ))
+
+        # 1c) Teacher with zero available days but has assignments
         for teacher, t_data in b.teachers.items():
-            if not b.idx.teacher_avail_days[teacher]:
-                total = sum(int(a.get("lessons", 0)) for a in b.idx.teacher_assignments[teacher])
-                if total > 0:
-                    add(Suggestion(type="teacher_never_available", message=f"{teacher} has {total} lessons assigned but is unavailable every day.", fixes=[f"Remove some unavailable days for {teacher}", f"Redistribute {teacher}'s lessons to other teachers", f"Remove all of {teacher}'s assignments"], priority=1, metadata={"teacher": teacher}))
-        total_required = sum(b.idx.required_lessons.values())
-        total_slots = len(b.class_groups) * b.num_days * b.num_slots
-        if total_required > total_slots:
-            shortage = total_required - total_slots
-            add(Suggestion(type="capacity_overload", message=f"Total required lessons ({total_required}) exceed available slots ({total_slots}) by {shortage}.", fixes=[f"Reduce total lessons by at least {shortage}", f"Consolidate a stream to free {b.num_days * b.num_slots} slots", "Add an extra working day (last resort)"], priority=2))
-        for teacher, t_data in b.teachers.items():
-            max_weekly = t_data.get("maxLessons")
-            if not max_weekly:
-                continue
-            total = sum(int(a.get("lessons", 0)) for a in b.idx.teacher_assignments[teacher])
-            if total > int(max_weekly):
-                over = total - int(max_weekly)
-                add(Suggestion(type="teacher_overload", message=f"{teacher} is assigned {total} lessons but weekly maximum is {max_weekly}.", fixes=[f"Reduce {teacher}'s assignments by {over} lessons", f"Increase {teacher}'s weekly limit to at least {total}", "Move some lessons to another teacher"], priority=2, metadata={"teacher": teacher}))
+            avail_days = b.idx.teacher_avail_days.get(teacher, set())
+            if not avail_days:
+                total_assigned = sum(int(a.get("lessons", 0)) for a in b.idx.teacher_assignments.get(teacher, []))
+                if total_assigned > 0:
+                    add(Suggestion(
+                        type="teacher_never_available",
+                        message=f"{teacher} has {total_assigned} lessons assigned but is unavailable on ALL days.",
+                        fixes=[
+                            f"Remove unavailable days for {teacher} (currently marked unavailable every day)",
+                            f"Reassign all {total_assigned} of {teacher}'s lessons to other teachers",
+                            f"Remove {teacher}'s assignments entirely"
+                        ],
+                        priority=1,
+                        metadata={"teacher": teacher, "lessons": total_assigned}
+                    ))
+
+        # 1d) Subject-requirement mismatch (grade needs subject but no teacher for that grade)
+        for subject in b.subjects:
+            for grade in b.grades:
+                required = b.idx.required_lessons.get((grade, subject), 0)
+                if required > 0:
+                    # Find teachers assigned to this subject for this grade
+                    teachers_for_this = []
+                    for teacher, assigns in b.idx.teacher_assignments.items():
+                        for a in assigns:
+                            if a.get("grade") == grade and a.get("subject") == subject:
+                                teachers_for_this.append(teacher)
+                                break
+
+                    if not teachers_for_this:
+                        add(Suggestion(
+                            type="grade_subject_unassigned",
+                            message=f"Grade {grade} needs {required} lessons of {subject} but no teacher is assigned to teach {subject} for Grade {grade}.",
+                            fixes=[
+                                f"Assign a teacher to teach {subject} specifically for Grade {grade}",
+                                f"Remove {subject} requirement for Grade {grade}",
+                                f"Add a new teacher qualified to teach {subject}"
+                            ],
+                            priority=1,
+                            metadata={"grade": grade, "subject": subject}
+                        ))
+
+        # =====================================================================
+        # PHASE 2: SOFT CONSTRAINT VIOLATIONS (Capacity, Overload)
+        # =====================================================================
         if not suggestions:
-            add(Suggestion(type="complex_conflict", message="Solver could not find a solution; constraints interact in a complex way.", fixes=["Reduce lessons incrementally to isolate the conflict", "Verify stream-specific assignment indices", "Review blacklist entries", "Increase the solver time limit"], priority=3))
+            # Check only if no hard conflicts found
+            total_required = sum(b.idx.required_lessons.values())
+            total_slots = len(b.class_groups) * b.num_days * b.num_slots
+
+            if total_required > total_slots:
+                shortage = total_required - total_slots
+                # Find subjects with highest lesson counts
+                subject_totals = defaultdict(int)
+                for (g, s), req in b.idx.required_lessons.items():
+                    subject_totals[s] += req
+                high_volume = sorted(subject_totals.items(), key=lambda x: x[1], reverse=True)[:3]
+                subject_names = [f"{s[0]} ({s[1]} lessons)" for s in high_volume]
+
+                add(Suggestion(
+                    type="capacity_overload",
+                    message=f"Total required lessons ({total_required}) exceed available slots ({total_slots}) by {shortage}.",
+                    fixes=[
+                        f"Reduce lessons by {shortage}. Highest volume subjects: {', '.join(subject_names)}",
+                        f"Remove or combine a stream to free {b.num_days * b.num_slots} slots",
+                        f"LAST RESORT: Add an extra working day (adds {len(b.class_groups) * b.num_slots} slots)"
+                    ],
+                    priority=2
+                ))
+
+            # Teacher overload
+            for teacher, t_data in b.teachers.items():
+                max_weekly = t_data.get("maxLessons")
+                if not max_weekly:
+                    continue
+                total = sum(int(a.get("lessons", 0)) for a in b.idx.teacher_assignments.get(teacher, []))
+                if total > int(max_weekly):
+                    over = total - int(max_weekly)
+                    # Find other teachers who teach same subjects
+                    teacher_subjects = set()
+                    for a in b.idx.teacher_assignments.get(teacher, []):
+                        teacher_subjects.add(a.get("subject"))
+
+                    available_teachers = []
+                    for other_t, other_assigns in b.idx.teacher_assignments.items():
+                        if other_t == teacher:
+                            continue
+                        other_subjects = set(a.get("subject") for a in other_assigns)
+                        if teacher_subjects.intersection(other_subjects):
+                            other_total = sum(int(a.get("lessons", 0)) for a in other_assigns)
+                            other_max = b.teachers[other_t].get("maxLessons")
+                            if other_max and other_total < int(other_max):
+                                available_teachers.append(other_t)
+
+                    fixes = [f"Reduce {teacher}'s lessons by {over} (from {total} to {max_weekly})"]
+                    if available_teachers:
+                        fixes.append(f"Reassign {over} lessons to {available_teachers[0]} (teaches same subjects, has capacity)")
+                    fixes.append(f"LAST RESORT: Increase {teacher}'s weekly max to {total}")
+
+                    add(Suggestion(
+                        type="teacher_overload",
+                        message=f"{teacher} is assigned {total} lessons but weekly maximum is {max_weekly}.",
+                        fixes=fixes,
+                        priority=2,
+                        metadata={"teacher": teacher}
+                    ))
+
+            # Daily limit check
+            for teacher, t_data in b.teachers.items():
+                if t_data.get("isSpecial", False):
+                    continue
+                max_pd = int(t_data.get("maxPerDay", b.global_max_per_day))
+                avail_days = len(b.idx.teacher_avail_days.get(teacher, set()))
+                total = sum(int(a.get("lessons", 0)) for a in b.idx.teacher_assignments.get(teacher, []))
+
+                if avail_days > 0 and total / avail_days > max_pd:
+                    daily_needed = total / avail_days
+                    suggested_max = int(daily_needed) + 1
+                    reduction = total - (max_pd * avail_days)
+
+                    fixes = [f"Increase {teacher}'s daily max from {max_pd} to at least {suggested_max}"]
+                    if reduction > 0:
+                        fixes.append(f"Reduce {teacher}'s total lessons by {reduction} (from {total} to {max_pd * avail_days})")
+                    fixes.append(f"Increase {teacher}'s available days (currently {avail_days} days)")
+
+                    add(Suggestion(
+                        type="daily_limit",
+                        message=f"{teacher} needs {daily_needed:.1f} lessons/day but daily maximum is {max_pd}.",
+                        fixes=fixes,
+                        priority=2,
+                        metadata={"teacher": teacher}
+                    ))
+
+        # =====================================================================
+        # PHASE 3: FALLBACK (if nothing specific was found)
+        # =====================================================================
+        if not suggestions:
+            # Last resort - check for common session conflicts
+            if b.common_session.get("enabled"):
+                effective_slots = b.num_days * b.num_slots - 1
+                for cg in b.class_groups:
+                    for subject in b.subjects:
+                        required = b.idx.required_lessons.get((cg["grade"], subject), 0)
+                        if required > effective_slots:
+                            add(Suggestion(
+                                type="common_session_conflict",
+                                message=f"Grade {cg['grade']} {cg['stream_name']} needs {required} lessons of {subject} but only {effective_slots} slots available (common session takes one).",
+                                fixes=[
+                                    f"Reduce {subject} lessons to {effective_slots}",
+                                    f"Disable common session or move it to a break slot",
+                                    f"Add an extra working day"
+                                ],
+                                priority=2,
+                                metadata={"grade": cg["grade"], "subject": subject}
+                            ))
+
+        # Final fallback
+        if not suggestions:
+            add(Suggestion(
+                type="complex_conflict",
+                message="Solver could not find a solution; constraints interact in a complex way.",
+                fixes=[
+                    "Try reducing the total number of lessons gradually to isolate the conflict",
+                    "Check if any teacher is assigned to multiple grades with conflicting schedules",
+                    "Verify stream-specific assignment indices match correctly",
+                    "Review all blacklist entries for contradictions",
+                    "Increase the solver time limit (current: 300s)"
+                ],
+                priority=3
+            ))
+
         suggestions.sort(key=lambda s: s.priority)
         logger.info("Generated %d infeasibility suggestions", len(suggestions))
         return suggestions
@@ -480,14 +690,14 @@ def generate():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "timestamp": time.time(), "service": "EduSchedule Pro", "version": "5.0.0"})
+    return jsonify({"status": "ok", "timestamp": time.time(), "service": "EduSchedule Pro", "version": "5.1.0"})
 
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("EduSchedule Pro Backend v5.0.0")
+    logger.info("EduSchedule Pro Backend v5.1.0")
     logger.info("  - No empty class slots (== 1 constraint)")
     logger.info("  - Special teacher support")
-    logger.info("  - Specific infeasibility suggestions")
+    logger.info("  - SPECIFIC infeasibility suggestions with exact details")
     logger.info("=" * 60)
     app.run(debug=False, host="0.0.0.0", port=5000)
