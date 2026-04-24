@@ -1,6 +1,6 @@
 """
-EduSchedule Pro Backend — Version 6.3.3 (User‑Specified Adjustments)
-Advanced Timetable Generator with per‑subject lesson adjustment endpoint.
+EduSchedule Pro Backend — Version 6.3.4 (Smart Infra‑specific Suggestions)
+Advanced Timetable Generator with exact per‑subject reduction hints.
 """
 
 from __future__ import annotations
@@ -201,7 +201,6 @@ class ModelBuilder:
         self.grade_stream_names = config.get("gradeStreamNames",{})
         self.common_session = config.get("commonSession",{"enabled":False})
         self.global_max_per_day = int(r.get("maxTeacherPerDay",8))
-        # blacklist attributes
         self.blacklist = set(config.get("blacklist", []))
         self.subject_blacklist = set(config.get("subjectBlacklist", []))
         self.penalise_back_to_back_subjects: Set[str] = set(r.get("noBackToBack",[]))
@@ -347,7 +346,7 @@ class SolutionExtractor:
                 vs.append(Violation(desc,sev,v,v*w,cov).to_dict())
         return vs
 
-# ── SUPER‑POWERED INFEASIBILITY ANALYSER ────────────────────────────
+# ── SUPER‑POWERED INFEASIBILITY ANALYSER (with SMART MIS PROBE) ─────────
 class InfeasibilityAnalyser:
     def __init__(self, builder: ModelBuilder): self.b = builder
 
@@ -655,12 +654,12 @@ class InfeasibilityAnalyser:
                         metadata={"teacher":t,"grade":grade}
                     ))
 
-        # ── 13. MIS probe ──
-        if not suggestions:
-            suggestions.extend(self._mis_probe())
-
-        # ── 14. Fallback ──
-        if not suggestions:
+        # ── 13. MIS probe (SMART version) ───────────────────────────
+        mis_suggestions = self._mis_probe()
+        if mis_suggestions:
+            suggestions.extend(mis_suggestions)
+        else:
+            # ── 14. Fallback ──
             add(Suggestion(
                 type="complex",
                 message="Complex constraint conflict — no single root cause identified.",
@@ -673,49 +672,145 @@ class InfeasibilityAnalyser:
         return suggestions
 
     def _mis_probe(self) -> List[Suggestion]:
+        """Enhanced MIS probe that finds exact per‑subject reduction requirements."""
         b = self.b
         out = []
-        def try_relaxed(extra_ub: int) -> bool:
+
+        def try_relaxed(max_per_slot: int) -> bool:
             m = cp_model.CpModel()
             x = {}
             for cg in b.class_groups:
-                ck = cg["key"]; x[ck] = {}
+                ck = cg["key"]
+                x[ck] = {}
                 for d in range(b.num_days):
                     x[ck][d] = {}
                     for s in range(b.num_slots):
                         x[ck][d][s] = {}
-                        for t,tv in b.x[ck][d][s].items():
-                            for sub,_ in tv.items():
-                                sv = x[ck][d][s].setdefault(t,{})
+                        for t, tv in b.x[ck][d][s].items():
+                            for sub, _ in tv.items():
+                                sv = x[ck][d][s].setdefault(t, {})
                                 sv[sub] = m.NewBoolVar(f"r_{ck}_{d}_{s}_{t}_{sub}")
-            for cg in b.class_groups:
-                ck = cg["key"]
                 for d in range(b.num_days):
                     for s in range(b.num_slots):
                         sv = [v for tv in x[ck][d][s].values() for v in tv.values()]
-                        if sv: m.Add(sum(sv)==1)
+                        if sv:
+                            m.Add(sum(sv) == 1)
             for t in b.teachers:
                 for d in range(b.num_days):
                     for s in range(b.num_slots):
-                        tv = [v for cg in b.class_groups for v in x[cg["key"]][d][s].get(t,{}).values()]
-                        if tv: m.Add(sum(tv)<=extra_ub)
+                        tv = [v for cg in b.class_groups
+                              for v in x[cg["key"]][d][s].get(t, {}).values()]
+                        if tv:
+                            m.Add(sum(tv) <= max_per_slot)
             cp = cp_model.CpSolver()
             cp.parameters.max_time_in_seconds = 5.0
             cp.parameters.num_search_workers = 4
             status = cp.Solve(m)
             return status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
 
-        if try_relaxed(2):
-            out.append(Suggestion(
-                type="mis_teacher_conflict",
-                message="Schedule becomes feasible if teachers could teach 2 classes at once → teacher availability is the bottleneck.",
-                fixes=[
-                    "SOLUTION A — Add more teachers for peak slots",
-                    "SOLUTION B — Reduce parallel streams",
-                    "SOLUTION C — Stagger timetables"
-                ],
-                priority=1, effort=2, impact=3
-            ))
+        # Check if relaxed (2 teachers per slot) solves it
+        if not try_relaxed(2):
+            return out  # not a teacher‑slot bottleneck
+
+        # ── Identify per‑subject bottleneck ──────────────────────────────
+        sub_totals: Dict[str, int] = defaultdict(int)
+        sub_grade_detail: Dict[str, List[Dict]] = defaultdict(list)
+
+        for (grade, sub), req in b.idx.required_lessons.items():
+            if req == 0:
+                continue
+            sub_totals[sub] += req
+            sub_grade_detail[sub].append({"grade": grade, "required": req})
+
+        total_req = sum(b.idx.required_lessons.values())
+        total_slots = len(b.class_groups) * b.num_days * b.num_slots
+        global_shortage = max(0, total_req - total_slots)
+
+        # Rank subjects by total lesson count (biggest first)
+        ranked_subjects = sorted(sub_totals.items(), key=lambda x: x[1], reverse=True)
+
+        fixes = []
+        adjustment_hints: List[Dict] = []  # machine‑readable for UI
+
+        for sub, total in ranked_subjects[:6]:
+            # Binary search for minimum cut size for this subject alone
+            min_cut = None
+            lo, hi = 1, total
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                # Temporarily reduce this subject's lessons in required_lessons
+                original = {}
+                for (g, s2), req in b.idx.required_lessons.items():
+                    if s2 == sub:
+                        original[(g, s2)] = req
+                        b.idx.required_lessons[(g, s2)] = max(0, req - mid)
+                feasible = try_relaxed(1)  # now try strict (max_per_slot=1)
+                # Restore
+                for key, val in original.items():
+                    b.idx.required_lessons[key] = val
+                if feasible:
+                    min_cut = mid
+                    hi = mid - 1
+                else:
+                    lo = mid + 1
+
+            if min_cut is not None:
+                new_total = total - min_cut
+                grade_breakdown = "; ".join(
+                    f"Grade {d['grade']}: {d['required']}→{max(0, d['required'] - min_cut)}"
+                    for d in sub_grade_detail[sub][:4]
+                )
+                fixes.append(
+                    f"Reduce {sub} by {min_cut} lesson(s) total "
+                    f"(current: {total} → target: {new_total}). "
+                    f"Grade breakdown: {grade_breakdown}"
+                )
+                adjustment_hints.append({
+                    "subject": sub,
+                    "currentTotal": total,
+                    "reduceBy": min_cut,
+                    "newTotal": new_total,
+                    "gradeBreakdown": sub_grade_detail[sub]
+                })
+            else:
+                # Reducing this subject alone does not fix; still give a proportional hint
+                num_subs = max(1, len(ranked_subjects))
+                proportional_cut = max(1, round(global_shortage / num_subs))
+                fixes.append(
+                    f"{sub} contributes {total} lessons — reducing it alone is insufficient, "
+                    f"but reducing by {proportional_cut} (to {total - proportional_cut}) helps"
+                )
+                adjustment_hints.append({
+                    "subject": sub,
+                    "currentTotal": total,
+                    "reduceBy": proportional_cut,
+                    "newTotal": max(0, total - proportional_cut),
+                    "gradeBreakdown": sub_grade_detail[sub],
+                    "partialFix": True
+                })
+
+        if not fixes:
+            fixes = [
+                "SOLUTION A — Add more teachers for peak slots",
+                "SOLUTION B — Reduce parallel streams",
+                "SOLUTION C — Stagger timetables",
+            ]
+
+        subject_summary = ", ".join(
+            f"{h['subject']} −{h['reduceBy']}" for h in adjustment_hints[:5]
+        )
+
+        out.append(Suggestion(
+            type="mis_teacher_conflict",
+            message=(
+                f"Schedule becomes feasible if teachers could teach 2 classes at once "
+                f"→ teacher availability is the bottleneck. "
+                f"Suggested reductions: {subject_summary or 'see fixes below'}."
+            ),
+            fixes=fixes,
+            priority=1, effort=2, impact=3,
+            metadata={"adjustmentHints": adjustment_hints}
+        ))
         return out
 
 # ── Pre‑solve analyser ──────────────────────────────────────────────
@@ -881,7 +976,7 @@ def run_solver(config, timeout=300.0, workers=8, cid="?", progress=None):
 # ── Routes ─────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    """Enhanced UI with adjustment sliders."""
+    """Enhanced UI with adjustment sliders and pre‑fill from suggestion hints."""
     return render_template_string('''
     <!DOCTYPE html>
     <html>
@@ -893,27 +988,24 @@ def index():
             button { margin-left: 10px; cursor: pointer; padding: 0.5rem 1rem; }
             pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; border-radius: 5px; }
             .section { margin-bottom: 20px; }
+            .hint { background: #e8f0fe; padding: 10px; border-left: 4px solid #1a73e8; margin: 10px 0; }
         </style>
     </head>
     <body>
         <h1>📅 Timetable Generator – Adjust Learning Areas</h1>
         <p>Upload your configuration (JSON), then adjust lesson counts per subject. Negative = reduce, positive = increase.</p>
-
         <div class="section">
             <input type="file" id="configFile" accept=".json">
             <button onclick="loadConfig()">Load Config</button>
         </div>
-
         <div id="subjectList"></div>
-
         <div class="section">
             <button onclick="runWithAdjustments()">🚀 Generate Timetable</button>
             <button onclick="resetAdjustments()">Reset Adjustments</button>
         </div>
-
+        <div id="suggestionHints" style="display:none;" class="hint"></div>
         <h3>Result</h3>
         <pre id="result">Awaiting input...</pre>
-
         <script>
             let originalConfig = null;
             let currentSubjects = [];
@@ -927,6 +1019,7 @@ def index():
                         originalConfig = JSON.parse(e.target.result);
                         buildSubjectUI(originalConfig);
                         document.getElementById('result').innerText = "Config loaded. Adjust lessons and click Generate.";
+                        document.getElementById('suggestionHints').style.display = 'none';
                     } catch(err) {
                         alert("Invalid JSON: " + err.message);
                     }
@@ -946,8 +1039,8 @@ def index():
                 for (const sub of currentSubjects) {
                     html += `<div class="subject-row">
                         <strong>${sub}</strong>
-                        <input type="number" id="adj_${sub}" value="0" step="1" style="width:80px;">
-                        <span>lessons</span>
+                        <input type="number" id="adj_${sub}" value="0" step="1" style="width:100px;">
+                        <span>lessons (total change)</span>
                     </div>`;
                 }
                 html += '</div>';
@@ -959,6 +1052,7 @@ def index():
                     const inp = document.getElementById(`adj_${sub}`);
                     if (inp) inp.value = 0;
                 }
+                document.getElementById('suggestionHints').style.display = 'none';
             }
 
             async function runWithAdjustments() {
@@ -980,9 +1074,42 @@ def index():
                     });
                     const data = await response.json();
                     document.getElementById('result').innerText = JSON.stringify(data, null, 2);
+                    
+                    // If the response contains adjustment hints (from the infeasibility analyser), pre‑fill them
+                    if (data.suggestions && data.suggestions.length > 0) {
+                        for (const sug of data.suggestions) {
+                            if (sug.metadata && sug.metadata.adjustmentHints) {
+                                displayAdjustmentHints(sug.metadata.adjustmentHints);
+                                break;
+                            }
+                        }
+                    }
                 } catch (err) {
                     document.getElementById('result').innerText = "Error: " + err.message;
                 }
+            }
+
+            function displayAdjustmentHints(hints) {
+                const container = document.getElementById('suggestionHints');
+                if (!hints || hints.length === 0) return;
+                let html = '<strong>💡 Suggested reductions from MIS analyser:</strong><ul>';
+                for (const h of hints) {
+                    html += `<li>${h.subject}: reduce by ${h.reduceBy} lessons (from ${h.currentTotal} → ${h.newTotal})</li>`;
+                }
+                html += '</ul><button onclick="applySuggestedAdjustments()">Apply Suggested Adjustments</button>';
+                container.innerHTML = html;
+                container.style.display = 'block';
+                window.suggestedHints = hints;
+            }
+
+            function applySuggestedAdjustments() {
+                if (!window.suggestedHints) return;
+                for (const h of window.suggestedHints) {
+                    const inp = document.getElementById(`adj_${h.subject}`);
+                    if (inp) inp.value = -h.reduceBy;  // negative because we reduce
+                }
+                document.getElementById('suggestionHints').style.display = 'none';
+                alert("Suggested reductions applied. Click 'Generate Timetable' to run.");
             }
         </script>
     </body>
@@ -991,46 +1118,121 @@ def index():
 
 @app.route("/adjust", methods=["POST"])
 def adjust_lessons():
-    """Apply user‑specified adjustments to subject lesson counts and solve."""
+    """Apply user-specified per-subject adjustments and solve.
+    
+    Expects JSON body:
+    {
+        "config": { ...full config... },
+        "adjustments": {
+            "MATHEMATICS": -3,   // reduce by 3 across all teachers/grades
+            "ENGLISH": 2          // increase by 2
+        }
+    }
+    Each adjustment is applied proportionally across all teacher assignments
+    for that subject (largest assignments reduced first, increases spread evenly).
+    """
     try:
         data = request.get_json(force=True)
         if not data or "config" not in data or "adjustments" not in data:
             return jsonify({"error": "Missing 'config' or 'adjustments'"}), 400
 
         config = data["config"]
-        adjustments = data["adjustments"]  # e.g. {"MATHEMATICS": -5}
+        adjustments: Dict[str, int] = data["adjustments"]
+
+        if not isinstance(adjustments, dict):
+            return jsonify({"error": "'adjustments' must be an object like {\"MATHEMATICS\": -3}"}), 400
+        for sub, delta in adjustments.items():
+            if not isinstance(delta, (int, float)):
+                return jsonify({"error": f"Adjustment for '{sub}' must be a number, got {type(delta).__name__}"}), 400
 
         import copy
         new_config = copy.deepcopy(config)
 
-        # Modify lesson counts in assignments
-        for teacher, tdata in new_config.get("teachers", {}).items():
+        # Compute before counts per subject
+        before: Dict[str, int] = defaultdict(int)
+        for tdata in new_config.get("teachers", {}).values():
             for assign in tdata.get("assignments", []):
-                subj = assign.get("subject")
-                if subj in adjustments:
-                    old = int(assign.get("lessons", 0))
-                    new_val = max(0, old + adjustments[subj])
-                    assign["lessons"] = new_val
+                sub = assign.get("subject")
+                if sub:
+                    before[sub] += int(assign.get("lessons", 0))
 
-        # Run solver
+        # Apply adjustments
+        for sub, delta in adjustments.items():
+            if delta == 0:
+                continue
+
+            # Collect all assignments for this subject
+            target_assigns = []
+            for tdata in new_config.get("teachers", {}).values():
+                for assign in tdata.get("assignments", []):
+                    if assign.get("subject") == sub:
+                        target_assigns.append(assign)
+
+            if not target_assigns:
+                logger.warning("Adjustment requested for unknown subject '%s' — skipped", sub)
+                continue
+
+            remaining_delta = delta
+
+            if delta < 0:
+                # Reduce: take from largest assignments first
+                target_assigns.sort(key=lambda a: int(a.get("lessons", 0)), reverse=True)
+                for assign in target_assigns:
+                    if remaining_delta == 0:
+                        break
+                    old = int(assign.get("lessons", 0))
+                    cut = min(old, abs(remaining_delta))
+                    assign["lessons"] = old - cut
+                    remaining_delta += cut  # remaining_delta is negative, adding cut moves toward 0
+            else:
+                # Increase: spread evenly
+                target_assigns.sort(key=lambda a: int(a.get("lessons", 0)))  # smaller first
+                per_assign = remaining_delta // len(target_assigns)
+                extra = remaining_delta % len(target_assigns)
+                for i, assign in enumerate(target_assigns):
+                    old = int(assign.get("lessons", 0))
+                    add = per_assign + (1 if i < extra else 0)
+                    assign["lessons"] = old + add
+
+        # Compute after summary
+        after: Dict[str, int] = defaultdict(int)
+        for tdata in new_config.get("teachers", {}).values():
+            for assign in tdata.get("assignments", []):
+                sub = assign.get("subject")
+                if sub:
+                    after[sub] += int(assign.get("lessons", 0))
+
+        changes_summary = {}
+        for sub in set(list(before.keys()) + list(after.keys())):
+            b_val = before.get(sub, 0)
+            a_val = after.get(sub, 0)
+            if b_val != a_val:
+                changes_summary[sub] = {"before": b_val, "after": a_val, "delta": a_val - b_val}
+
+        # Solve
         timeout = float(request.args.get("timeout", 300))
         workers = int(request.args.get("workers", 8))
-        tt, stats, violations, suggestions = run_solver(new_config, timeout=timeout, workers=workers)
+        tt, stats, violations, suggestions = run_solver(
+            new_config, timeout=timeout, workers=workers
+        )
 
         if tt is not None:
             return jsonify({
                 "success": True,
                 "timetable": tt,
                 "violations": violations,
-                "stats": stats.to_dict()
+                "stats": stats.to_dict(),
+                "adjustmentsSummary": changes_summary,
             })
         else:
             return jsonify({
                 "success": False,
                 "message": "Adjusted config still infeasible",
                 "suggestions": [s.to_dict() for s in suggestions],
-                "stats": stats.to_dict()
+                "stats": stats.to_dict(),
+                "adjustmentsSummary": changes_summary,
             })
+
     except Exception as e:
         logger.error("Adjust error: %s", e, exc_info=True)
         return jsonify({"error": str(e)}), 500
@@ -1109,7 +1311,7 @@ def stream():
 def health():
     return jsonify({
         "status":"ok","timestamp":time.time(),
-        "service":"EduSchedule Pro","version":"6.3.3",
+        "service":"EduSchedule Pro","version":"6.3.4",
         "cache":_cache.stats()
     })
 
@@ -1126,7 +1328,7 @@ signal.signal(signal.SIGTERM, _on_sigterm)
 
 if __name__ == "__main__":
     logger.info("="*60)
-    logger.info("EduSchedule Pro v6.3.3 — User‑Specified Adjustments")
+    logger.info("EduSchedule Pro v6.3.4 — Smart MIS Probe & Exact Reductions")
     logger.info("="*60)
     port = int(os.environ.get("PORT", 10000))
     app.run(debug=False, host="0.0.0.0", port=port)
