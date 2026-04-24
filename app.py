@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json, os, logging
+import json, os, logging, traceback
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
@@ -16,10 +16,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Allow any frontend to call this API
 
 # ----------------------------------------------------------------------
-# Validation (with helpful error for missing 'type')
+# Validation
 # ----------------------------------------------------------------------
 def validate_config(c):
     required = ["grades", "subjects", "teachers", "timeSlots", "workingDays"]
@@ -30,7 +30,7 @@ def validate_config(c):
         return False, "'timeSlots' must be a list"
     for idx, slot in enumerate(c["timeSlots"]):
         if "type" not in slot:
-            return False, f"timeSlots[{idx}] missing 'type' (did you write 'Docrype'?)"
+            return False, f"timeSlots[{idx}] missing 'type' (maybe 'Docrype'?)"
     lesson_slots = [s for s in c["timeSlots"] if s.get("type") == "lesson"]
     if not lesson_slots:
         return False, "No timeSlot with type='lesson' found"
@@ -167,17 +167,12 @@ class Extractor:
 # Auto‑reduction (core logic)
 # ----------------------------------------------------------------------
 def auto_reduce(config):
-    """
-    Returns (new_config, timetable, info) after applying minimal lesson reductions.
-    """
-    # First, compute total lessons before
+    """Returns (new_config, timetable, info) after minimal reductions."""
     orig_builder = ModelBuilder(config)
     total_before = sum(orig_builder.idx.required_lessons.values())
 
-    # For each subject, binary search the minimal total reduction needed
     subject_reductions = {}
     for sub in config["subjects"]:
-        # Total lessons of this subject
         total_sub = 0
         for (g, s), val in orig_builder.idx.required_lessons.items():
             if s == sub:
@@ -189,10 +184,8 @@ def auto_reduce(config):
         best = total_sub
         while low <= high:
             mid = (low + high) // 2
-            # Build test config with `mid` lessons removed from this subject
             test_config = json.loads(json.dumps(config))
             remaining = mid
-            # Find all assignments for this subject, sorted descending
             assigns = []
             for t, tdata in test_config["teachers"].items():
                 for a in tdata.get("assignments", []):
@@ -207,7 +200,6 @@ def auto_reduce(config):
                 a["lessons"] = old - cut
                 remaining -= cut
 
-            # Test feasibility with strict constraints
             b_test = ModelBuilder(test_config)
             b_test.add_hard()
             b_test.add_soft()
@@ -227,7 +219,7 @@ def auto_reduce(config):
     if not subject_reductions:
         return None, None, [{"message": "No subject reduction resolves infeasibility. Check teacher availability."}]
 
-    # Apply the reductions to the original config
+    # Apply reductions
     final_config = json.loads(json.dumps(config))
     for sub, reduce_by in subject_reductions.items():
         remaining = reduce_by
@@ -245,7 +237,6 @@ def auto_reduce(config):
             a["lessons"] = old - cut
             remaining -= cut
 
-    # Solve with reduced config
     builder_final = ModelBuilder(final_config)
     builder_final.add_hard()
     builder_final.add_soft()
@@ -256,10 +247,7 @@ def auto_reduce(config):
     if status_final in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         tt = Extractor(builder_final, solver_final).extract()
         total_after = sum(builder_final.idx.required_lessons.values())
-        info = [{
-            "message": f"Auto‑reduced lessons by {total_before - total_after}",
-            "details": subject_reductions
-        }]
+        info = [{"message": f"Auto‑reduced lessons by {total_before - total_after}", "details": subject_reductions}]
         return final_config, tt, info
     else:
         return None, None, [{"message": "Reductions applied but still infeasible"}]
@@ -268,7 +256,6 @@ def auto_reduce(config):
 # Solver entry point
 # ----------------------------------------------------------------------
 def run_solver(config):
-    # Try original config
     builder = ModelBuilder(config)
     builder.add_hard()
     builder.add_soft()
@@ -280,7 +267,6 @@ def run_solver(config):
         tt = Extractor(builder, solver).extract()
         return tt, []
 
-    # Otherwise auto‑reduce
     _, tt, info = auto_reduce(config)
     if tt:
         return tt, info
@@ -288,68 +274,43 @@ def run_solver(config):
         return None, info
 
 # ----------------------------------------------------------------------
-# API routes
+# API routes – all return JSON (no HTML)
 # ----------------------------------------------------------------------
 @app.route("/generate", methods=["POST"])
 def generate():
+    # Always return JSON, even for errors
     try:
         data = request.get_data(as_text=True)
         if not data:
             return jsonify({"success": False, "message": "Empty request body"}), 400
         config = json.loads(data)
     except json.JSONDecodeError as e:
-        return jsonify({
-            "success": False,
-            "message": f"Invalid JSON: {str(e)}. Check for typos like 'Docrype' instead of 'type'."
-        }), 400
+        return jsonify({"success": False, "message": f"Invalid JSON: {str(e)}. Check for typos like 'Docrype'."}), 400
+    except Exception as e:
+        return jsonify({"success": False, "message": f"Error reading request: {str(e)}"}), 400
 
     ok, msg = validate_config(config)
     if not ok:
-        return jsonify({"success": False, "message": msg})
+        return jsonify({"success": False, "message": msg}), 400
 
-    tt, info = run_solver(config)
-    if tt:
-        return jsonify({"success": True, "timetable": tt, "info": info})
-    else:
-        return jsonify({"success": False, "suggestions": info})
+    try:
+        tt, info = run_solver(config)
+        if tt:
+            return jsonify({"success": True, "timetable": tt, "info": info})
+        else:
+            return jsonify({"success": False, "suggestions": info})
+    except Exception as e:
+        logger.error(traceback.format_exc())
+        return jsonify({"success": False, "message": f"Internal solver error: {str(e)}"}), 500
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def home():
-    return render_template_string('''
-    <!DOCTYPE html>
-    <html>
-    <head><title>EduSchedule Pro</title>
-    <style>body{font-family:Arial;margin:2rem}pre{background:#f4f4f4;padding:1rem;border-radius:5px}button{padding:0.5rem 1rem}</style>
-    </head>
-    <body>
-        <h1>📅 Timetable Generator (Strict Teacher‑Slot)</h1>
-        <p>Upload your config JSON – the system automatically reduces the fewest lessons if needed.</p>
-        <input type="file" id="configFile" accept=".json">
-        <button onclick="generate()">Generate Timetable</button>
-        <pre id="result">Awaiting input...</pre>
-        <script>
-            async function generate() {
-                const file = document.getElementById('configFile').files[0];
-                if (!file) return;
-                const text = await file.text();
-                let config;
-                try { config = JSON.parse(text); } catch(e) {
-                    document.getElementById('result').innerText = "Invalid JSON: " + e.message;
-                    return;
-                }
-                document.getElementById('result').innerText = "Solving...";
-                try {
-                    const res = await fetch('/generate', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config) });
-                    const data = await res.json();
-                    document.getElementById('result').innerText = JSON.stringify(data, null, 2);
-                } catch(e) {
-                    document.getElementById('result').innerText = "Network error: " + e.message;
-                }
-            }
-        </script>
-    </body>
-    </html>
-    ''')
+    # Return a simple JSON status (or a minimal HTML for humans)
+    return jsonify({"status": "EduSchedule Pro backend is running", "endpoints": ["/generate (POST)"]})
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
 
 # ----------------------------------------------------------------------
 # Run
