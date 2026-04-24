@@ -1,5 +1,5 @@
 """
-EduSchedule Pro Backend — Version 6.4.3 (Full – no false over‑utilised warnings + clear capacity advice)
+EduSchedule Pro Backend — Version 6.4.4 (Precise, actionable infeasibility diagnostics)
 """
 
 from __future__ import annotations
@@ -385,7 +385,7 @@ class SolutionExtractor:
                 vs.append(Violation(desc,sev,v,v*w,cov).to_dict())
         return vs
 
-# ── CLEAN INFEASIBILITY ANALYSER (no false over‑utilisation) ────────
+# ── ULTRA‑SPECIFIC INFEASIBILITY ANALYSER ───────────────────────────
 class InfeasibilityAnalyser:
     def __init__(self, builder: ModelBuilder): self.b = builder
 
@@ -401,10 +401,55 @@ class InfeasibilityAnalyser:
                 suggestions.append(s)
 
         t_assign = b.idx.teacher_assignments
-        t_total_lessons = {t: sum(int(a.get("lessons",0)) for a in assigns) for t,assigns in t_assign.items()}
+        t_total_lessons = {t: sum(int(a.get("lessons",0)) for a in assigns)
+                           for t,assigns in t_assign.items()}
         teacher_avail_days = b.idx.teacher_avail_days
 
-        # 1. Capacity overload – global
+        # ── 1. Per‑class capacity (each stream must fit into weekly slots) ──
+        for cg in b.class_groups:
+            ck, grade, sn = cg["key"], cg["grade"], cg["stream_name"]
+            stream_req = b.idx.class_required.get((grade, cg["stream_index"]), {})
+            total_class_lessons = sum(stream_req.values())
+            max_slots_per_class = b.num_days * b.num_slots
+            if total_class_lessons > max_slots_per_class:
+                short = total_class_lessons - max_slots_per_class
+                # Identify the heaviest subjects in this stream to suggest reduction
+                top_subs = sorted(stream_req.items(), key=lambda x: x[1], reverse=True)
+                top_subs_str = ", ".join(f"{s}({n})" for s,n in top_subs[:4])
+                fixes = [f"SOLUTION A — Reduce total lessons for Grade {grade} {sn} from {total_class_lessons} to {max_slots_per_class} or fewer."]
+                fixes.append(f"SOLUTION B — Reduce these specific subjects: {top_subs_str} (by at least {short} total).")
+                fixes.append(f"SOLUTION C — Add a working day or more lesson slots per day to increase capacity.")
+                add(Suggestion(
+                    type="class_capacity",
+                    message=f"Grade {grade} {sn} requires {total_class_lessons} lessons but has only {max_slots_per_class} available slots (overflow {short}).",
+                    fixes=fixes,
+                    priority=1, effort=2, impact=3,
+                    metadata={"grade":grade,"stream":sn,"required":total_class_lessons,"maxSlots":max_slots_per_class}
+                ))
+
+        # ── 2. Per‑Teacher capacity (teacher total lessons vs. available slots) ──
+        for t,td in b.teachers.items():
+            if td.get("isSpecial"): continue
+            avail_days = teacher_avail_days.get(t, set())
+            # A teacher can teach at most one lesson per slot.
+            total_avail_slots = len(avail_days) * b.num_slots
+            total_req_t = t_total_lessons.get(t, 0)
+            if total_req_t > total_avail_slots:
+                ov = total_req_t - total_avail_slots
+                fixes = [
+                    f"SOLUTION A — Reduce {t}'s lessons by {ov} (from {total_req_t} to {total_avail_slots}).",
+                    f"SOLUTION B — Make {t} available on more days (currently {len(avail_days)} out of {b.num_days}).",
+                    f"SOLUTION C — Mark {t} as 'Special' to bypass this limit."
+                ]
+                add(Suggestion(
+                    type="teacher_capacity",
+                    message=f"{t} must teach {total_req_t} lessons but has only {total_avail_slots} available slots in the week.",
+                    fixes=fixes,
+                    priority=1, effort=1, impact=3,
+                    metadata={"teacher":t,"totalLessons":total_req_t,"availableSlots":total_avail_slots}
+                ))
+
+        # ── 3. Global capacity shortage ──
         total_req = sum(b.idx.required_lessons.values())
         total_slots = len(b.class_groups) * b.num_days * b.num_slots
         if total_req > total_slots:
@@ -421,13 +466,13 @@ class InfeasibilityAnalyser:
             fixes.append(f"SOLUTION C — Add a lesson slot per day (gains {len(b.class_groups)*b.num_days} slots)")
             add(Suggestion(
                 type="capacity_overload",
-                message=f"Total required lessons ({total_req}) exceed available slots ({total_slots}) by {shortage}.",
+                message=f"Total required lessons ({total_req}) exceed all available slots ({total_slots}) by {shortage}.",
                 fixes=fixes,
                 priority=2, effort=3, impact=3,
                 metadata={"totalRequired":total_req,"totalSlots":total_slots,"shortage":shortage}
             ))
 
-        # 2. Empty slots (no teacher available at all for a class at that slot)
+        # ── 4. Empty slots (no teacher for that class at that slot) ──
         for cg in b.class_groups:
             ck, grade, sn = cg["key"], cg["grade"], cg["stream_name"]
             grade_teachers = {t for t,assigns in t_assign.items() if any(int(a.get("grade",0))==grade for a in assigns)}
@@ -462,7 +507,7 @@ class InfeasibilityAnalyser:
                     metadata={"grade":grade,"stream":sn,"emptyCount":len(empty_slots)}
                 ))
 
-        # 3. Missing teacher for a required subject
+        # ── 5. Missing teacher for a required subject ──
         for cg in b.class_groups:
             ck, grade, sn = cg["key"], cg["grade"], cg["stream_name"]
             stream_req = b.idx.class_required.get((grade, cg["stream_index"]), {})
@@ -484,7 +529,7 @@ class InfeasibilityAnalyser:
                         metadata={"grade":grade,"subject":sub,"required":req}
                     ))
 
-        # 4. Teacher never available
+        # ── 6. Teacher never available at all ──
         for t,td in b.teachers.items():
             if not teacher_avail_days.get(t,set()):
                 tot = t_total_lessons.get(t,0)
@@ -501,42 +546,42 @@ class InfeasibilityAnalyser:
                         metadata={"teacher":t,"totalLessons":tot}
                     ))
 
-        # 5. Teacher overload (weekly max)
+        # ── 7. Teacher overload (weekly max) ──
         for t,td in b.teachers.items():
             if td.get("isSpecial"): continue
             mw = td.get("maxLessons")
             if not mw: continue
             tot = t_total_lessons.get(t,0)
-            if tot <= int(mw): continue
-            ov = tot - int(mw)
-            t_subjects = {a.get("subject") for a in t_assign.get(t,[])}
-            alternates = []
-            for ot,oa in t_assign.items():
-                if ot == t: continue
-                os = {a.get("subject") for a in oa}
-                overlap = t_subjects & os
-                if not overlap: continue
-                ot_tot = t_total_lessons[ot]
-                om = b.teachers[ot].get("maxLessons")
-                if om and ot_tot < int(om):
-                    cap = int(om) - ot_tot
-                    alternates.append((ot, cap, list(overlap)[:3]))
-            fixes = [f"SOLUTION A — Reduce {t}'s lessons by {ov} (from {tot} → {mw})"]
-            if alternates:
-                for ot, cap, shared in alternates[:3]:
-                    move = min(ov, cap)
-                    fixes.append(f"SOLUTION B — Move up to {move} lessons to {ot} (shares {', '.join(shared)}, has {cap} free)")
-            fixes.append(f"SOLUTION C — Increase {t}'s weekly max from {mw} to {tot}")
-            fixes.append(f"SOLUTION D — Mark {t} as 'Special' (no workload limits)")
-            add(Suggestion(
-                type="teacher_overload",
-                message=f"{t} has {tot} lessons but max is {mw} (over by {ov}).",
-                fixes=fixes,
-                priority=2, effort=1, impact=2,
-                metadata={"teacher":t,"assigned":tot,"max":int(mw),"over":ov}
-            ))
+            if tot > int(mw):
+                ov = tot - int(mw)
+                t_subjects = {a.get("subject") for a in t_assign.get(t,[])}
+                alternates = []
+                for ot,oa in t_assign.items():
+                    if ot == t: continue
+                    os = {a.get("subject") for a in oa}
+                    overlap = t_subjects & os
+                    if not overlap: continue
+                    ot_tot = t_total_lessons[ot]
+                    om = b.teachers[ot].get("maxLessons")
+                    if om and ot_tot < int(om):
+                        cap = int(om) - ot_tot
+                        alternates.append((ot, cap, list(overlap)[:3]))
+                fixes = [f"SOLUTION A — Reduce {t}'s lessons by {ov} (from {tot} → {mw})"]
+                if alternates:
+                    for ot, cap, shared in alternates[:3]:
+                        move = min(ov, cap)
+                        fixes.append(f"SOLUTION B — Move up to {move} lessons to {ot} (shares {', '.join(shared)}, has {cap} free)")
+                fixes.append(f"SOLUTION C — Increase {t}'s weekly max from {mw} to {tot}")
+                fixes.append(f"SOLUTION D — Mark {t} as 'Special' (no workload limits)")
+                add(Suggestion(
+                    type="teacher_overload",
+                    message=f"{t} has {tot} lessons but weekly max is {mw}.",
+                    fixes=fixes,
+                    priority=2, effort=1, impact=2,
+                    metadata={"teacher":t,"assigned":tot,"max":int(mw),"over":ov}
+                ))
 
-        # 6. Subject impossible in one week for a stream
+        # ── 8. Subject impossible in one week for a stream ──
         for cg in b.class_groups:
             ck,grade,sn = cg["key"],cg["grade"],cg["stream_name"]
             max_slots = b.num_days * b.num_slots
@@ -553,7 +598,7 @@ class InfeasibilityAnalyser:
                         metadata={"grade":grade,"subject":sub,"required":req,"maxSlots":max_slots}
                     ))
 
-        # 7. Daily availability bottleneck
+        # ── 9. Daily availability bottleneck ──
         day_shortage = defaultdict(lambda: {"unavail_teachers":[], "affected_classes":0})
         for cg in b.class_groups:
             ck = cg["key"]
@@ -561,7 +606,8 @@ class InfeasibilityAnalyser:
                 sv_count = sum(1 for s in range(b.num_slots) for tv in b.x[ck][d][s].values() if tv)
                 if sv_count == 0:
                     day_shortage[d]["affected_classes"] += 1
-                    grade_teachers = [t for t,assigns in t_assign.items() if any(int(a.get("grade",0))==cg["grade"] for a in assigns)]
+                    grade_teachers = [t for t,assigns in t_assign.items()
+                                     if any(int(a.get("grade",0))==cg["grade"] for a in assigns)]
                     for t in grade_teachers:
                         if d not in teacher_avail_days.get(t,set()):
                             if t not in day_shortage[d]["unavail_teachers"]:
@@ -581,10 +627,11 @@ class InfeasibilityAnalyser:
                             f"SOLUTION C — Remove {day_name} from the timetable"
                         ],
                         priority=1, effort=2, impact=3,
-                        metadata={"day":day_name,"affectedClasses":data["affected_classes"],"unavailableTeachers":teachers_to_fix}
+                        metadata={"day":day_name,"affectedClasses":data["affected_classes"],
+                                  "unavailableTeachers":teachers_to_fix}
                     ))
 
-        # 8. Subject schedule crowding
+        # ── 10. Subject schedule crowding ──
         for sub in b.subjects:
             total_lessons_sub = sum(b.idx.required_lessons.get((g,sub),0) for g in b.grades)
             avg_per_day = total_lessons_sub / (b.num_days * len(b.class_groups)) if b.class_groups else 0
@@ -601,7 +648,7 @@ class InfeasibilityAnalyser:
                     metadata={"subject":sub,"totalLessons":total_lessons_sub,"avgPerDay":round(avg_per_day,2)}
                 ))
 
-        # 9. Stream merging suggestion (only if streams > 1)
+        # ── 11. Stream merging suggestion ──
         grade_streams = defaultdict(list)
         for cg in b.class_groups:
             grade_streams[cg["grade"]].append(cg["stream_name"])
@@ -622,7 +669,7 @@ class InfeasibilityAnalyser:
                         metadata={"grade":grade,"streams":streams,"required":grade_req,"oneStreamSlots":one_stream_slots}
                     ))
 
-        # 10. Teacher assignment trimming
+        # ── 12. Teacher assignment trimming ──
         for t,td in b.teachers.items():
             if td.get("isSpecial"): continue
             assigns = t_assign.get(t,[])
@@ -632,7 +679,7 @@ class InfeasibilityAnalyser:
             if len(unique_grades) >= 3 and len(unique_subjects) >= 4 and total_lessons > 20:
                 add(Suggestion(
                     type="teacher_scope_trim",
-                    message=f"{t} teaches {len(unique_grades)} grades and {len(unique_subjects)} different subjects simultaneously.",
+                    message=f"{t} teaches {len(unique_grades)} grades and {len(unique_subjects)} different subjects.",
                     fixes=[
                         f"SOLUTION A — Reduce {t}'s grades to 1‑2 (currently {', '.join(str(g) for g in sorted(unique_grades)[:3])})",
                         f"SOLUTION B — Reduce {t}'s subjects to 1‑2 (currently {', '.join(list(unique_subjects)[:4])})",
@@ -642,7 +689,7 @@ class InfeasibilityAnalyser:
                     metadata={"teacher":t,"grades":sorted(unique_grades),"subjects":list(unique_subjects)[:5]}
                 ))
 
-        # 11. Blacklist conflict
+        # ── 13. Blacklist conflict ──
         for t,td in b.teachers.items():
             for cg in b.class_groups:
                 grade = cg["grade"]
@@ -657,12 +704,14 @@ class InfeasibilityAnalyser:
                         metadata={"teacher":t,"grade":grade}
                     ))
 
-        # Fallback
+        # ── Fallback (should rarely trigger now) ──
         if not suggestions:
             add(Suggestion(
                 type="complex",
                 message="Complex constraint conflict — no single root cause identified.",
-                fixes=["Gradually reduce lesson counts","Check stream assignments","Increase solver timeout"],
+                fixes=["Increase solver timeout (try 600 seconds).",
+                       "Check if a teacher is assigned to a subject they are not available for.",
+                       "Try enabling 'Special' status for all teachers temporarily to see if workload limits are the cause."],
                 priority=3, effort=3, impact=2
             ))
 
@@ -688,7 +737,8 @@ def pre_solve_analyse(config):
     for g in grades:
         for sub in subjects:
             req = idx.required_lessons.get((g,sub),0)
-            has = any(int(a.get("grade",0))==g and a.get("subject")==sub for assigns in idx.teacher_assignments.values() for a in assigns)
+            has = any(int(a.get("grade",0))==g and a.get("subject")==sub
+                     for assigns in idx.teacher_assignments.values() for a in assigns)
             if req>0 and not has:
                 errors_out.append({"type":"no_teacher","message":f"Grade {g} needs {sub} but no teacher assigned"})
     for t,avail in idx.teacher_avail_days.items():
@@ -807,7 +857,7 @@ def stream():
 def health():
     return jsonify({
         "status":"ok","timestamp":time.time(),
-        "service":"EduSchedule Pro","version":"6.4.3",
+        "service":"EduSchedule Pro","version":"6.4.4",
         "cache":_cache.stats()
     })
 
@@ -824,6 +874,6 @@ signal.signal(signal.SIGTERM, _on_sigterm)
 
 if __name__ == "__main__":
     logger.info("="*60)
-    logger.info("EduSchedule Pro v6.4.3 – Actionable capacity suggestions")
+    logger.info("EduSchedule Pro v6.4.4 – Specific per‑teacher/per‑class capacity")
     logger.info("="*60)
     app.run(debug=False, host="0.0.0.0", port=5000)
