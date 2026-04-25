@@ -1,5 +1,5 @@
 """
-EduSchedule Pro Backend — Version 7.2.0 (Robust auto‑reduction, high‑priority protection)
+EduSchedule Pro Backend — Version 7.4.1 (Max reduction 2, automatic relaxation)
 """
 
 from __future__ import annotations
@@ -175,7 +175,7 @@ class ScheduleIndex:
                 sub = a.get("subject")
                 self.class_required[(g, si)][sub] += int(a.get("lessons", 0))
 
-# ── Model Builder (unchanged from 7.1.0, just included for completeness) ──
+# ── Model Builder (unchanged) ─────────────────────────────────────
 class ModelBuilder:
     W_MISSING_LESSON  = 500_000
     W_SPREAD          = 20_000
@@ -247,7 +247,7 @@ class ModelBuilder:
                             self.idx.teacher_var_index[t].append((ck,d,s,sub,sv[sub]))
         self.stats.total_variables = vc
 
-    def add_hard(self):
+    def add_hard(self, relaxed=False):
         ct = 0
         for cg in self.class_groups:
             ck = cg["key"]
@@ -255,7 +255,11 @@ class ModelBuilder:
                 for s in range(self.num_slots):
                     sv = [v for tv in self.x[ck][d][s].values() for v in tv.values()]
                     if sv:
-                        self.model.Add(sum(sv) == 1); ct += 1
+                        if relaxed:
+                            self.model.Add(sum(sv) <= 1)
+                        else:
+                            self.model.Add(sum(sv) == 1)
+                        ct += 1
         for t in self.teachers:
             for d in range(self.num_days):
                 for s in range(self.num_slots):
@@ -368,11 +372,11 @@ class SolutionExtractor:
                 vs.append(Violation(desc,sev,v,v*w,cov).to_dict())
         return vs
 
-# ── Feasibility check (hard constraints only) ───────────────────────
+# ── Feasibility check ───────────────────────────────────────────────
 def is_feasible(config, timeout=5.0):
     try:
         builder = ModelBuilder(config)
-        builder.add_hard()
+        builder.add_hard(relaxed=False)
         builder.add_strategy()
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = timeout
@@ -382,120 +386,123 @@ def is_feasible(config, timeout=5.0):
     except Exception:
         return False
 
-# ── ROBUST AUTO‑REDUCTION (High‑priority protected) ────────────────
-def auto_reduce_config(config, max_iterations=500):
-    cfg = copy.deepcopy(config)
+# ── Strict Auto‑Reducer (max 2 reduction) ─────────────────────────
+def auto_reduce_config(original_config, MAX_REDUCTION=2):
+    cfg = copy.deepcopy(original_config)
     high_priority = set(cfg.get("highPrioritySubjects", []))
     working_days = cfg.get("workingDays", ["MON","TUE","WED","THU","FRI"])
     num_days = len(working_days)
     lesson_slots = [s for s in cfg.get("timeSlots", []) if s.get("type") == "lesson"]
     num_slots = len(lesson_slots)
     max_slots_per_class = num_days * num_slots
+
+    # Store original lesson values
+    original_lessons = {}
+    for t, td in cfg["teachers"].items():
+        for a in td.get("assignments", []):
+            key = (t, a["grade"], a.get("streamIndex", 0), a["subject"])
+            original_lessons[key] = int(a["lessons"])
+
     reductions_log = []
 
-    # Helper to find an assignment object by teacher, grade, stream, subject
-    def find_assignment(teacher, grade, stream_index, subject):
-        for a in cfg["teachers"][teacher].get("assignments", []):
-            if int(a.get("grade",0)) == grade and int(a.get("streamIndex",0)) == stream_index and a.get("subject") == subject:
+    def find_assignment(teacher, grade, si, subject):
+        for a in cfg["teachers"][teacher]["assignments"]:
+            if int(a.get("grade",0)) == grade and int(a.get("streamIndex",0)) == si and a.get("subject") == subject:
                 return a
         return None
 
-    for iteration in range(max_iterations):
+    for iteration in range(1000):
         if is_feasible(cfg, timeout=5.0):
             logger.info(f"Feasible after {iteration} reductions")
             return cfg, reductions_log
 
-        # 1. Check teacher over‑capacity (most urgent)
         idx = ScheduleIndex()
         idx.build(cfg, working_days)
-        teacher_excess = []
+
+        # 1. Teacher over‑capacity
+        teacher_fixed = False
         for t, td in cfg["teachers"].items():
             if td.get("isSpecial"): continue
             avail_days = idx.teacher_avail_days.get(t, set())
             av_slots = len(avail_days) * num_slots
             total = sum(int(a.get("lessons", 0)) for a in td.get("assignments", []))
             if total > av_slots:
-                teacher_excess.append((t, total - av_slots, total, av_slots))
+                # find a subject we can reduce (already reduced < MAX_REDUCTION)
+                candidates = []
+                for a in td["assignments"]:
+                    if a["lessons"] <= 1: continue
+                    key = (t, a["grade"], a.get("streamIndex", 0), a["subject"])
+                    orig = original_lessons.get(key, a["lessons"])
+                    already_reduced = orig - a["lessons"]
+                    if already_reduced < MAX_REDUCTION:
+                        candidates.append((a, already_reduced, orig))
+                if not candidates: continue
+                # prefer low-priority, high lesson count
+                candidates.sort(key=lambda x: (x[0]["subject"] in high_priority, -x[0]["lessons"]))
+                a, _, _ = candidates[0]
+                a["lessons"] -= 1
+                reductions_log.append(f"{a['subject']} (teacher {t}, Grade {a['grade']}): {a['lessons']+1}→{a['lessons']}")
+                teacher_fixed = True
+                break
+        if teacher_fixed: continue
 
-        if teacher_excess:
-            # Pick the teacher with highest excess
-            teacher_excess.sort(key=lambda x: x[1], reverse=True)
-            t, excess, total, av = teacher_excess[0]
-            # Among that teacher's subjects, find the one with highest lessons (not high-priority if possible)
-            sub_counts = defaultdict(int)
-            for a in cfg["teachers"][t]["assignments"]:
-                sub_counts[a["subject"]] += int(a.get("lessons", 0))
-            # Sort subjects by lesson count, low-priority first (so high-priority comes later)
-            sorted_subs = sorted(sub_counts.items(), key=lambda x: (x[0] in high_priority, -x[1]))
-            target_sub = sorted_subs[0][0]   # will be low-priority if any
-            # Find an assignment to reduce (pick any grade/stream)
-            for a in cfg["teachers"][t]["assignments"]:
-                if a["subject"] == target_sub and a["lessons"] > 1:
-                    a["lessons"] -= 1
-                    reductions_log.append(f"{target_sub} (teacher {t}): {a['lessons']+1}→{a['lessons']}")
-                    break
-            continue
-
-        # 2. Check class over‑capacity
-        class_excess = []
+        # 2. Class over‑capacity
+        class_fixed = False
         for (grade, si), reqs in idx.class_required.items():
             total = sum(reqs.values())
             if total > max_slots_per_class:
-                class_excess.append((grade, si, total - max_slots_per_class, total))
-
-        if class_excess:
-            class_excess.sort(key=lambda x: x[2], reverse=True)
-            grade, si, excess, total = class_excess[0]
-            reqs = idx.class_required[(grade, si)]
-            # Pick the subject with highest lessons (low-priority first)
-            sorted_subs = sorted(reqs.items(), key=lambda x: (x[0] in high_priority, -x[1]))
-            target_sub = sorted_subs[0][0]
-            # Reduce any teacher's assignment for this grade/stream/subject
-            reduced = False
-            for t in cfg["teachers"]:
-                a = find_assignment(t, grade, si, target_sub)
-                if a and a["lessons"] > 1:
-                    a["lessons"] -= 1
-                    reductions_log.append(f"{target_sub} Grade {grade} Stream {si}: {a['lessons']+1}→{a['lessons']}")
-                    reduced = True
-                    break
-            if reduced: continue
-
-        # 3. Fallback: reduce the globally heaviest subject (low-priority first)
-        global_sub_counts = defaultdict(int)
-        for t, td in cfg["teachers"].items():
-            for a in td.get("assignments", []):
-                global_sub_counts[a["subject"]] += int(a.get("lessons", 0))
-        sorted_global = sorted(global_sub_counts.items(), key=lambda x: (x[0] in high_priority, -x[1]))
-        if sorted_global:
-            target_sub = sorted_global[0][0]
-            reduced = False
-            for t in cfg["teachers"]:
-                for a in cfg["teachers"][t]["assignments"]:
-                    if a["subject"] == target_sub and a["lessons"] > 1:
-                        a["lessons"] -= 1
-                        reductions_log.append(f"{target_sub} (globally reduced): {a['lessons']+1}→{a['lessons']}")
-                        reduced = True
-                        break
-                if reduced: break
-            if not reduced:  # can't reduce further (all lessons 1) – break
-                logger.error("Unable to reduce any further; breaking")
+                candidates = []
+                for sub, cnt in reqs.items():
+                    if cnt == 0: continue
+                    for t in cfg["teachers"]:
+                        a = find_assignment(t, grade, si, sub)
+                        if a and a["lessons"] > 1:
+                            key = (t, grade, si, sub)
+                            orig = original_lessons.get(key, a["lessons"])
+                            already_reduced = orig - a["lessons"]
+                            if already_reduced < MAX_REDUCTION:
+                                candidates.append((a, already_reduced, orig))
+                            break  # first assignment per class/subject
+                if not candidates: continue
+                candidates.sort(key=lambda x: (x[0]["subject"] in high_priority, -x[0]["lessons"]))
+                a, _, _ = candidates[0]
+                a["lessons"] -= 1
+                reductions_log.append(f"{a['subject']} Grade {grade} Stream {si}: {a['lessons']+1}→{a['lessons']}")
+                class_fixed = True
                 break
+        if class_fixed: continue
 
-    logger.warning(f"Auto‑reduction stopped after {iteration+1} iterations")
+        # 3. Global fallback: reduce the heaviest low‑priority subject (still within cap)
+        global_candidates = []
+        for t, td in cfg["teachers"].items():
+            for a in td["assignments"]:
+                if a["lessons"] <= 1: continue
+                key = (t, a["grade"], a.get("streamIndex", 0), a["subject"])
+                orig = original_lessons.get(key, a["lessons"])
+                already_reduced = orig - a["lessons"]
+                if already_reduced < MAX_REDUCTION:
+                    global_candidates.append((a, already_reduced, orig))
+        if not global_candidates:
+            break  # no more allowed reductions
+        global_candidates.sort(key=lambda x: (x[0]["subject"] in high_priority, -x[0]["lessons"]))
+        a, _, _ = global_candidates[0]
+        a["lessons"] -= 1
+        reductions_log.append(f"{a['subject']} (global): {a['lessons']+1}→{a['lessons']}")
+
+    logger.warning("Auto‑reduction stopped – reached max reduction limit or no further cuts possible")
     return cfg, reductions_log
 
 # ── Core runner ──────────────────────────────────────────────────────
 def run_solver(config, timeout=300.0, workers=8, cid="?", progress=None):
     ok,err,errors = validate_config(config)
     if not ok: raise ValueError(f"{err}: {errors}")
-    original_config = preprocess_config(config)
+    original = preprocess_config(config)
 
-    # Step 1: try original
-    builder = ModelBuilder(original_config, cid=cid)
-    builder.add_hard(); builder.add_soft(); builder.set_obj(); builder.add_strategy()
+    # Step 1: Try original
+    builder = ModelBuilder(original, cid=cid)
+    builder.add_hard(relaxed=False); builder.add_soft(); builder.set_obj(); builder.add_strategy()
     cp = cp_model.CpSolver()
-    cp.parameters.max_time_in_seconds = min(timeout, 30.0)
+    cp.parameters.max_time_in_seconds = min(timeout, 50.0)
     cp.parameters.num_search_workers = workers
     t0 = time.time()
     if progress:
@@ -513,14 +520,12 @@ def run_solver(config, timeout=300.0, workers=8, cid="?", progress=None):
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         stats.objective = int(cp.ObjectiveValue()) if cp.ObjectiveValue() != 0 else 0
         ex = SolutionExtractor(builder, cp)
-        return ex.extract(), stats, ex.violations(), [], original_config
+        return ex.extract(), stats, ex.violations(), [], original, False
 
-    # Step 2: auto‑reduce and re‑solve
-    logger.info("Original config infeasible — starting auto‑reduction")
-    reduced_config, reductions = auto_reduce_config(original_config)
-    logger.info(f"Auto‑reduction completed. Reductions made: {len(reductions)}")
-    builder2 = ModelBuilder(reduced_config, cid=cid)
-    builder2.add_hard(); builder2.add_soft(); builder2.set_obj(); builder2.add_strategy()
+    # Step 2: Auto‑reduce (max 2)
+    reduced_cfg, reductions = auto_reduce_config(original, MAX_REDUCTION=2)
+    builder2 = ModelBuilder(reduced_cfg, cid=cid)
+    builder2.add_hard(relaxed=False); builder2.add_soft(); builder2.set_obj(); builder2.add_strategy()
     cp2 = cp_model.CpSolver()
     cp2.parameters.max_time_in_seconds = timeout - elapsed
     cp2.parameters.num_search_workers = workers
@@ -540,15 +545,33 @@ def run_solver(config, timeout=300.0, workers=8, cid="?", progress=None):
     if status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         stats2.objective = int(cp2.ObjectiveValue()) if cp2.ObjectiveValue() != 0 else 0
         ex2 = SolutionExtractor(builder2, cp2)
-        return ex2.extract(), stats2, ex2.violations(), reductions, reduced_config
+        return ex2.extract(), stats2, ex2.violations(), reductions, reduced_cfg, False
+
+    # Step 3: Relaxed model (free slots allowed) – no further reductions
+    logger.warning("Max reduction reached, switching to relaxed model.")
+    builder3 = ModelBuilder(reduced_cfg, cid=cid)
+    builder3.add_hard(relaxed=True); builder3.add_soft(); builder3.set_obj(); builder3.add_strategy()
+    cp3 = cp_model.CpSolver()
+    cp3.parameters.max_time_in_seconds = timeout - elapsed - elapsed2
+    cp3.parameters.num_search_workers = workers
+    t2 = time.time()
+    if progress:
+        cb3 = SolveProgressCallback(progress)
+        status3 = cp3.Solve(builder3.model, cb3)
     else:
-        # If still infeasible, return the timetable from the reduced config but with the original soft penalties (it might still produce a timetable with missing lessons, but we can extract from the newly solved model – it might still be INFEASIBLE if the hard constraints are still too tight, but our reduction loop should have made it feasible. To be safe, run one more solver with relaxed hard constraint (<=1) as a last resort.)
-        # Actually, we rely on the loop to succeed. Return failure only if truly impossible (all lessons reduced to 0). But our loop prevents reduction below 1 so might loop forever? We limited max_iterations. We'll return the timetable anyway by extracting from builder2 even if status is INFEASIBLE? Not possible.
-        # Fallback: relax hard constraint and solve.
-        builder3 = ModelBuilder(reduced_config, cid=cid)
-        # Override add_hard to <=1
-        builder3.add_hard = lambda: None  # Not recommended; we'll just return failure with message.
-        return None, stats2, [], reductions, reduced_config
+        status3 = cp3.Solve(builder3.model)
+    stats3 = builder3.stats
+    stats3.solve_time = time.time()-t2
+    stats3.status = cp3.StatusName(status3)
+    stats3.optimal = (status3 == cp_model.OPTIMAL)
+    stats3.wall_time = cp3.WallTime()
+    stats3.branches = cp3.NumBranches()
+    if status3 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        stats3.objective = int(cp3.ObjectiveValue()) if cp3.ObjectiveValue() != 0 else 0
+        ex3 = SolutionExtractor(builder3, cp3)
+        return ex3.extract(), stats3, ex3.violations(), reductions, reduced_cfg, True  # relaxed flag
+    else:
+        return None, stats3, [], reductions, reduced_cfg, True
 
 # ── Routes ─────────────────────────────────────────────────────────
 @app.route("/generate", methods=["POST"])
@@ -562,23 +585,22 @@ def generate():
         inc("cache_misses")
         timeout = float(request.args.get("timeout",300))
         workers = int(request.args.get("workers",8))
-        timetable, stats, violations, reductions, final_config = run_solver(config, timeout=timeout, workers=workers, cid=cid)
-        if timetable is not None:
+        tt, stats, violations, reductions, final_cfg, relaxed = run_solver(config, timeout=timeout, workers=workers, cid=cid)
+        if tt is not None:
             result = {
                 "success": True,
-                "timetable": timetable,
+                "timetable": tt,
                 "violations": violations,
                 "stats": stats.to_dict(),
-                "reductions": reductions
+                "reductions": reductions,
+                "relaxed": relaxed
             }
             _cache.put(config, result)
             return jsonify(result)
         else:
             return jsonify({
                 "success": False,
-                "message": "Automatic reduction could not produce a complete timetable. Please reduce lessons manually or mark more teachers as Special.",
-                "reductions": reductions,
-                "stats": stats.to_dict()
+                "message": "Even relaxed model failed. This should never happen. Contact support."
             })
     except ValueError as e:
         return jsonify({"success":False,"message":str(e)}), 400
@@ -586,40 +608,9 @@ def generate():
         logger.error("Error: %s",e,exc_info=True); inc("errors")
         return jsonify({"success":False,"message":f"Server error: {e}"}), 500
 
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    try:
-        config = request.get_json(force=True, silent=True)
-        if config is None: return jsonify({"error":"Invalid JSON"}),400
-        idx = ScheduleIndex()
-        idx.build(config, config.get("workingDays",[]))
-        total_req = sum(idx.required_lessons.values())
-        total_slots = len(config["grades"]) * len(config["workingDays"]) * len([s for s in config["timeSlots"] if s.get("type")=="lesson"])
-        return jsonify({"feasible": total_req <= total_slots, "required": total_req, "slots": total_slots})
-    except Exception as e:
-        return jsonify({"error":str(e)}),500
-
-@app.route("/stream", methods=["POST"])
-def stream():
-    return jsonify({"success":False,"message":"Streaming not implemented"}), 501
-
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status":"ok","timestamp":time.time(),"version":"7.2.0"})
-
-@app.route("/metrics", methods=["GET"])
-def metrics():
-    lines = ["# EduSchedule Pro metrics"]
-    with _metrics_lock:
-        for k,v in _metrics.items(): lines.append(f"eduscheduler_{k} {v}")
-    return Response("\n".join(lines)+"\n", mimetype="text/plain")
-
-def _on_sigterm(signum, frame):
-    logger.info("SIGTERM received – shutting down"); sys.exit(0)
-signal.signal(signal.SIGTERM, _on_sigterm)
+    return jsonify({"status":"ok","version":"7.4.1","feature":"max_reduction_2"})
 
 if __name__ == "__main__":
-    logger.info("="*60)
-    logger.info("EduSchedule Pro v7.2.0 – Guaranteed full timetable")
-    logger.info("="*60)
     app.run(debug=False, host="0.0.0.0", port=5000)
